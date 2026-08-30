@@ -43,6 +43,8 @@ _ENV_VARS = (
     "BUZZ_ALLOWED_USERS",
     "BUZZ_ALLOW_ALL_USERS",
     "BUZZ_POLL_INTERVAL",
+    "BUZZ_REQUIRE_MENTION",
+    "BUZZ_TRANSPORT",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
 )
@@ -51,10 +53,14 @@ _ENV_VARS = (
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch, tmp_path):
     """Keep tests hermetic: no ambient Buzz env vars or real credentials."""
+    from agent import secret_scope
+
+    secret_scope.set_multiplex_active(False)
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-creds")
     yield
+    secret_scope.set_multiplex_active(False)
 
 
 def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind=9):
@@ -141,6 +147,54 @@ class TestBuzzAdapterInit:
         from gateway.config import PlatformConfig
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
+
+    def test_secondary_multiplex_scope_uses_profile_config_not_default_env(
+        self, monkeypatch, tmp_path
+    ):
+        from agent import secret_scope
+        from gateway.config import PlatformConfig
+
+        default_cli = tmp_path / "default-buzz"
+        default_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        profile_cli = tmp_path / "profile-buzz"
+        profile_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://default.relay")
+        monkeypatch.setenv("BUZZ_CHANNELS", "default-a,default-b,default-c")
+        monkeypatch.setenv("BUZZ_HOME_CHANNEL", "default-a")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(default_cli))
+        monkeypatch.setenv("BUZZ_POLL_INTERVAL", "30")
+        monkeypatch.setenv("BUZZ_REQUIRE_MENTION", "false")
+        monkeypatch.setenv("BUZZ_TRANSPORT", "poll")
+        monkeypatch.setenv("BUZZ_ALLOWED_USERS", "b" * 64)
+
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope({})
+        try:
+            adapter = BuzzAdapter(
+                PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "relay_url": "https://profile.relay",
+                        "channels": ["profile-a", "profile-b"],
+                        "home_channel": "profile-a",
+                        "cli_path": str(profile_cli),
+                        "poll_interval": 2,
+                        "require_mention": True,
+                        "transport": "websocket",
+                        "allowed_users": [OTHER_PUBKEY],
+                    },
+                )
+            )
+            assert adapter.relay_url == "https://profile.relay"
+            assert adapter.channels == ["profile-a", "profile-b"]
+            assert adapter.home_channel == "profile-a"
+            assert adapter.cli_path == str(profile_cli)
+            assert adapter.poll_interval == 2.0
+            assert adapter.require_mention is True
+            assert adapter.transport == "websocket"
+            assert adapter._allowed_pubkeys == {OTHER_PUBKEY}
+        finally:
+            secret_scope.reset_secret_scope(token)
 
 
 # ── CLI error contract ────────────────────────────────────────────────────
@@ -467,6 +521,30 @@ class TestBuzzAdapterLifecycle:
 
 
 # ── Credentials / requirements ────────────────────────────────────────────
+
+
+class TestRequirementGate:
+
+    def test_passive_gate_defers_instance_checks_and_validation_fails_closed(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+
+        assert check_requirements() is True
+        assert validate_config(PlatformConfig(enabled=True, extra={})) is False
+
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1profile")
+        configured = PlatformConfig(
+            enabled=True,
+            extra={
+                "relay_url": "https://profile.relay",
+                "cli_path": str(fake_cli),
+            },
+        )
+        assert validate_config(configured) is True
 
 
 class TestCredentialResolution:

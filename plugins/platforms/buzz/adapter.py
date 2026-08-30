@@ -50,7 +50,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import current_secret_scope as _current_secret_scope
 from agent.secret_scope import get_secret as _scoped_get_secret
+from agent.secret_scope import is_multiplex_active as _is_multiplex_active
 
 
 def _get_scoped_secret(name, default=None):
@@ -71,6 +73,27 @@ def _get_scoped_secret(name, default=None):
     except _UnscopedSecretError:
         val = os.getenv(name)
     return val if val is not None else default
+
+
+def _profile_config_is_authoritative() -> bool:
+    """Return True while constructing/running a scoped multiplex profile.
+
+    Buzz historically bridges YAML into process-global ``BUZZ_*`` variables.
+    Those remain valid overrides for single-profile deployments and the
+    unscoped default adapter, but they belong to the default profile inside a
+    multiplexer. A secondary adapter already receives its own ``PlatformConfig``
+    under a profile secret scope; reading global relay/channel/policy settings
+    there would overwrite that profile's instance configuration.
+    """
+    return _is_multiplex_active() and _current_secret_scope() is not None
+
+
+def _config_value(extra: dict, key: str, env_name: str, default: Any = "") -> Any:
+    """Resolve a non-secret Buzz setting without cross-profile env leakage."""
+    if _profile_config_is_authoritative():
+        return extra.get(key, default)
+    env_value = os.getenv(env_name)
+    return env_value if env_value not in (None, "") else extra.get(key, default)
 
 
 logger = logging.getLogger(__name__)
@@ -120,7 +143,7 @@ def _load_nostr_auth():
     the test plugin loader, where relative imports have no parent package.
     """
     try:
-        from . import nostr_auth  # type: ignore[no-redef]
+        from . import nostr_auth
 
         return nostr_auth
     except ImportError:
@@ -361,48 +384,65 @@ class BuzzAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
         self._extra = extra
 
-        # Connection settings (env vars override config.yaml)
-        self.relay_url = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
+        # Environment remains the legacy override outside a scoped multiplex
+        # profile. Secondary adapters must use their own PlatformConfig: the
+        # process-global BUZZ_* values belong to the default profile.
+        self.relay_url = str(
+            _config_value(extra, "relay_url", "BUZZ_RELAY_URL", "") or ""
+        ).strip()
         self.cli_path = _resolve_cli_path(
-            os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
+            str(_config_value(extra, "cli_path", "BUZZ_CLI_PATH", "") or "").strip()
         )
 
-        # Channels to watch: env csv > extra list/csv; empty = all joined channels
-        raw_channels = os.getenv("BUZZ_CHANNELS") or extra.get("channels", [])
+        raw_channels = _config_value(extra, "channels", "BUZZ_CHANNELS", [])
         if isinstance(raw_channels, str):
             raw_channels = raw_channels.split(",")
-        self.channels: List[str] = [c.strip() for c in raw_channels if isinstance(c, str) and c.strip()]
+        self.channels: List[str] = [
+            c.strip() for c in raw_channels if isinstance(c, str) and c.strip()
+        ]
 
-        self.home_channel = (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
+        self.home_channel = str(
+            _config_value(extra, "home_channel", "BUZZ_HOME_CHANNEL", "") or ""
+        ).strip()
 
         try:
-            interval = float(os.getenv("BUZZ_POLL_INTERVAL") or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL))
+            interval = float(
+                _config_value(
+                    extra,
+                    "poll_interval",
+                    "BUZZ_POLL_INTERVAL",
+                    _DEFAULT_POLL_INTERVAL,
+                )
+            )
         except (TypeError, ValueError):
             interval = _DEFAULT_POLL_INTERVAL
         self.poll_interval = max(_MIN_POLL_INTERVAL, interval)
 
         # Whether channel messages must @mention the agent to get a response.
-        # Defaults to True (respond only when addressed). Set False to make the
-        # agent respond to every message in a watched channel. DMs always
-        # dispatch regardless. Env (BUZZ_REQUIRE_MENTION) overrides config.yaml.
-        _rm_raw = os.getenv("BUZZ_REQUIRE_MENTION")
-        if _rm_raw is None:
-            _rm_cfg = extra.get("require_mention", True)
-        else:
-            _rm_cfg = _rm_raw
-        self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
+        # Defaults to True (respond only when addressed). DMs always dispatch.
+        _rm_cfg = _config_value(
+            extra, "require_mention", "BUZZ_REQUIRE_MENTION", True
+        )
+        self.require_mention = str(_rm_cfg).strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
 
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
-        # "websocket" (require WS; fail connect when it can't authenticate),
-        # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
-        # config.yaml.
-        _transport = (
-            os.getenv("BUZZ_TRANSPORT") or str(extra.get("transport", "auto") or "auto")
+        # "websocket" (require WS), or "poll" (CLI polling only).
+        _transport = str(
+            _config_value(extra, "transport", "BUZZ_TRANSPORT", "auto") or "auto"
         ).strip().lower()
-        self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
+        self.transport = (
+            _transport if _transport in ("auto", "websocket", "poll") else "auto"
+        )
 
-        # Auth: entries may be hex pubkeys or npubs; normalized to hex
-        raw_allowed = os.getenv("BUZZ_ALLOWED_USERS") or extra.get("allowed_users", [])
+        # Auth: entries may be hex pubkeys or npubs; normalized to hex.
+        raw_allowed = _config_value(
+            extra, "allowed_users", "BUZZ_ALLOWED_USERS", []
+        )
         if isinstance(raw_allowed, str):
             raw_allowed = raw_allowed.split(",")
         self._allowed_pubkeys: set = {
@@ -1257,17 +1297,24 @@ class BuzzAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 def check_requirements() -> bool:
-    """Check if Buzz is configured: a relay URL plus a resolvable key."""
-    if not os.getenv("BUZZ_RELAY_URL", "").strip():
-        return False
-    return bool(_resolve_private_key())
+    """Passive dependency probe.
+
+    Buzz uses only bundled Python dependencies. Its CLI path and profile
+    credentials are instance configuration, so they are validated below once
+    the profile's ``PlatformConfig`` is available. A no-argument probe cannot
+    safely inspect a secondary multiplex profile's configured CLI path.
+    """
+    return True
 
 
 def validate_config(config) -> bool:
-    """Validate that the platform config has enough info to connect."""
+    """Validate that the profile's Buzz instance can connect."""
     extra = getattr(config, "extra", {}) or {}
-    relay = os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")
-    return bool(relay and _resolve_private_key(extra))
+    relay = _config_value(extra, "relay_url", "BUZZ_RELAY_URL", "")
+    cli_path = _resolve_cli_path(
+        str(_config_value(extra, "cli_path", "BUZZ_CLI_PATH", "") or "").strip()
+    )
+    return bool(relay and cli_path and _resolve_private_key(extra))
 
 
 def is_connected(config) -> bool:
@@ -1278,15 +1325,13 @@ def is_connected(config) -> bool:
 def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     """Translate ``config.yaml`` ``buzz.extra`` keys into ``BUZZ_*`` env vars.
 
-    Implements the ``apply_yaml_config_fn`` contract.  ``check_requirements``
-    and the adapter's connect path read configuration from the environment, so
-    a config.yaml-only setup (no ``BUZZ_*`` env vars beyond the secret) would
-    otherwise fail the ``check_fn`` gate and be silently skipped at gateway
-    startup.  This hook bridges the ``extra`` block into env, mirroring the
-    Slack/Telegram pattern.  Env vars win over YAML — every assignment is
-    guarded by ``not os.getenv(...)`` so explicit env overrides survive a
-    config.yaml update.  ``BUZZ_PRIVATE_KEY`` is a secret and stays in ``.env``;
-    it is never sourced from config.yaml here.
+    Implements the ``apply_yaml_config_fn`` contract for legacy env-only
+    consumers and the unscoped default profile. Adapter construction and
+    validation also receive ``PlatformConfig.extra`` directly; scoped multiplex
+    profiles treat that mapping as authoritative so this process-global bridge
+    cannot leak the default profile's settings into them. Env vars still win for
+    single-profile and unscoped/default-profile operation. ``BUZZ_PRIVATE_KEY``
+    is a secret and stays in ``.env``; it is never sourced from config.yaml here.
     """
     extra = buzz_cfg.get("extra", buzz_cfg) or {}
     if not isinstance(extra, dict):
@@ -1374,16 +1419,20 @@ async def _standalone_send(
     fail with ``No live adapter for platform 'buzz'``.
     """
     extra = getattr(pconfig, "extra", {}) or {}
-    relay = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
+    relay = str(
+        _config_value(extra, "relay_url", "BUZZ_RELAY_URL", "") or ""
+    ).strip()
     private_key = _resolve_private_key(extra)
     cli_path = _resolve_cli_path(
-        os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
+        str(_config_value(extra, "cli_path", "BUZZ_CLI_PATH", "") or "").strip()
     )
     if not relay or not private_key:
         return {"error": "Buzz standalone send: BUZZ_RELAY_URL and BUZZ_PRIVATE_KEY must be configured"}
     if not cli_path:
         return {"error": "Buzz standalone send: buzz CLI binary not found"}
-    target = (chat_id or "").strip() or (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
+    target = (chat_id or "").strip() or str(
+        _config_value(extra, "home_channel", "BUZZ_HOME_CHANNEL", "") or ""
+    ).strip()
     if not target:
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
