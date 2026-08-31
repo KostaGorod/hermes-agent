@@ -81,6 +81,7 @@ gateway:
         allowed_users: []                 # empty = allow all if allow_all_users is true; otherwise restrict to listed npubs/hex pubkeys
         require_mention: true             # in channels: only respond when addressed (@name, npub, or hex pubkey); DMs always dispatch regardless
         allow_all_users: false            # set true for community mode (everyone can chat, only owner is admin); false for private mode (only allowed_users)
+        reactions: true                   # 👀 received → 🧠 working → ✅/❌ done reactions on each conversational turn
 ```
 
 **Why these defaults:**
@@ -100,6 +101,17 @@ gateway:
 - In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.
 - Direct messages always reach the agent, no mention needed.
 - The agent's own messages are never dispatched back to it (self-echo suppression by pubkey), and every event is de-duplicated by event id against a per-channel high-water mark.
+
+## Reaction lifecycle
+
+Buzz has no typing indicator, so the agent marks each conversational turn with emoji reactions on your message:
+
+- 👀 — received
+- 🧠 — working on it
+- ✅ — replied successfully
+- ❌ — failed (the error follows as a regular message)
+
+Only one reaction is shown at a time — each replaces the previous one. Commands (`/status`, `/stop`, …) don't get reactions, and senders who aren't authorized to talk to the agent never see any. Reactions are best-effort: if a reaction fails to update, the reply is unaffected. Set `reactions: false` in the `buzz` `extra` block to turn them off.
 
 ## Access control
 
