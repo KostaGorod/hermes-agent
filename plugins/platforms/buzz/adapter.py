@@ -25,11 +25,15 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            reply_in_thread: true      # false = post replies flat to the channel timeline
+            reaction_only_users: []    # acknowledge explicit tags without dispatching; allowed_users wins on overlap
+            reactions: true             # emoji reaction lifecycle (👀 received → 🧠 working → ✅/❌ done); false disables
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_REACTION_ONLY_USERS, BUZZ_ALLOW_ALL_USERS, BUZZ_REPLY_IN_THREAD,
+    BUZZ_REPLY_TO_MODE
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -50,7 +54,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import current_secret_scope as _current_secret_scope
 from agent.secret_scope import get_secret as _scoped_get_secret
+from agent.secret_scope import is_multiplex_active as _is_multiplex_active
 
 
 def _get_scoped_secret(name, default=None):
@@ -65,12 +71,61 @@ def _get_scoped_secret(name, default=None):
     profile's own value, so fall back to it. Same pattern as the Slack
     ``SLACK_APP_TOKEN`` read (#59739) and
     ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+
+    The no-scope path has one more rung for the platform requirement gate:
+    ``check_requirements()`` runs at gateway startup BEFORE any per-profile
+    secret scope is installed, and ``get_secret`` without a scope simply
+    reads ``os.environ`` — so a Bitwarden-managed ``BUZZ_PRIVATE_KEY``
+    (only ``BWS_ACCESS_TOKEN`` in ``.env``) was invisible to the check and
+    Buzz was silently skipped (#95216). When no scope is active and the
+    process env has no value, consult a one-shot build of the profile's
+    secret mapping (``build_profile_secret_scope`` resolves external secret
+    sources) so externally managed credentials pass the gate. An ACTIVE
+    scope still shadows this rung entirely — it never runs under
+    multiplexing, so cross-profile isolation is unchanged.
     """
     try:
-        val = _scoped_get_secret(name, default)
+        val = _scoped_get_secret(name, None)
     except _UnscopedSecretError:
         val = os.getenv(name)
+    if val is None and _current_secret_scope() is None:
+        val = _unscoped_profile_secrets().get(name)
     return val if val is not None else default
+
+
+_UNSCOPED_PROFILE_SECRETS: Optional[Dict[str, str]] = None
+
+
+def _unscoped_profile_secrets() -> Dict[str, str]:
+    """One-shot build of the active profile's secret mapping.
+
+    Cached for the process: the build shells out to external secret
+    resolvers (Bitwarden via ``BWS_ACCESS_TOKEN``), and the requirement
+    gate / validate / is_connected probes all want the same snapshot. Any
+    failure degrades to an empty mapping — callers then simply report the
+    platform as not configured, which is the pre-fix behavior. The cache
+    is startup-gate-only: it pins whatever ``get_hermes_home()`` resolved
+    on first build, so it must not be reused off the startup path (where
+    a profile scope is always active and shadows it anyway).
+    """
+    global _UNSCOPED_PROFILE_SECRETS
+    if _UNSCOPED_PROFILE_SECRETS is None:
+        try:
+            from agent.secret_scope import build_profile_secret_scope
+            from hermes_constants import get_hermes_home
+
+            _UNSCOPED_PROFILE_SECRETS = dict(
+                build_profile_secret_scope(get_hermes_home())
+            )
+        except Exception:
+            logger.warning(
+                "Buzz requirement probe could not build the profile secret "
+                "scope; Bitwarden-managed credentials will not be visible "
+                "to the startup gate (#95216)",
+                exc_info=True,
+            )
+            _UNSCOPED_PROFILE_SECRETS = {}
+    return _UNSCOPED_PROFILE_SECRETS
 
 
 def _profile_scoped() -> bool:
@@ -115,6 +170,7 @@ from gateway.platforms.base import (
     SendResult,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
 )
 from gateway.config import Platform
 
@@ -123,6 +179,49 @@ from gateway.config import Platform
 # returns housekeeping kinds (joins, canvas updates, …) — only kind 9 is
 # dispatched to the agent.
 _CHAT_KIND = 9
+# Kinds that carry agent-relevant conversation content and are dispatched
+# (#90309): chat messages (9) plus the Buzz forum kinds — 45001 is a forum
+# post (thread root) and 45003 a comment reply on it.  Block's own ACP
+# harness documents this set (``buzz-acp --kinds 9,46010,40007,45001,
+# 45002,45003``); the stream kinds (46010/40007/45002) are left out until
+# their dispatch semantics are confirmed.  ``_is_direct_message_event``
+# deliberately keeps the kind-9-only check: widening it there would let a
+# p-tagged forum post be reclassified as a DM and bypass mention gating.
+_DISPATCH_KINDS = frozenset({_CHAT_KIND, 45001, 45003})
+_UNRESOLVED_MENTION_ERROR_RE = re.compile(
+    r"mention '@(?P<name>[^']+)' does not match a current channel member"
+)
+_BUZZ_PRESENTATION_MENTION_SEPARATOR = "\u200b"
+
+
+def _escape_unresolved_presentation_mention(content: str, error: str) -> Optional[str]:
+    """Make one CLI-rejected ``@name`` token presentation-only.
+
+    Buzz resolves whitespace-prefixed ``@name`` tokens into notification
+    p-tags before signing or publishing. Ordinary prose such as a Hermes
+    ``@session:...`` link can therefore fail mention preflight. Insert an
+    invisible separator only after the rejected ``@`` so the rendered text
+    remains readable while valid member mentions remain unchanged.
+
+    Return ``None`` for unrelated errors or absent tokens. Callers retry at
+    most once.
+    """
+    match = _UNRESOLVED_MENTION_ERROR_RE.search(error or "")
+    if match is None:
+        return None
+    name = match.group("name")
+    if not name:
+        return None
+    token = re.compile(
+        rf"(?<!\S)@{re.escape(name)}(?=$|[^A-Za-z0-9._-])",
+        re.IGNORECASE,
+    )
+    escaped, count = token.subn(
+        lambda found: "@" + _BUZZ_PRESENTATION_MENTION_SEPARATOR + found.group(0)[1:],
+        content,
+    )
+    return escaped if count else None
+
 # How many events to request per poll / seed call.
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
@@ -134,6 +233,14 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+# Buzz presence records expire, so refresh comfortably before the relay TTL.
+_PRESENCE_INTERVAL = 60.0
+
+# Mention-resolution caches: member lists are cheap to refetch but hit on
+# every publish containing "@", so a short TTL amortizes the CLI round-trip;
+# display names change rarely, but must not survive a rename forever.
+_MEMBER_CACHE_TTL = 60.0
+_PROFILE_NAME_TTL = 300.0
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -280,35 +387,84 @@ def _resolve_cli_path(configured: str = "") -> str:
     return str(fallback) if fallback.is_file() else ""
 
 
-def _resolve_private_key(extra: Optional[dict] = None) -> str:
-    """Resolve the Nostr private key: env first, then a credentials JSON.
-
-    NEVER log the return value.
-    """
-    key = _get_scoped_secret("BUZZ_PRIVATE_KEY", "").strip()
-    if key:
-        return key
-    _creds_raw = _scoped_platform_setting("BUZZ_CREDENTIALS_FILE", extra, "credentials_file")
-    configured = str(_creds_raw or "").strip() or (extra or {}).get("credentials_file", "")
+def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
+    # Scope-aware read (#98738/#95216): inside a secondary profile scope the
+    # scope is authoritative (a miss falls to the profile's own config extra,
+    # never the default profile's os.environ); unscoped reads keep env
+    # precedence plus the external-secret rung.
+    configured = str(_get_scoped_secret("BUZZ_CREDENTIALS_FILE", "") or "").strip() or str(
+        (extra or {}).get("credentials_file", "") or ""
+    ).strip()
     if configured:
-        candidates = [Path(configured).expanduser()]
-    else:
-        try:
-            candidates = sorted(_DEFAULT_CREDENTIALS_DIR.glob("*credentials*.json"))
-        except OSError:
-            candidates = []
-    for path in candidates:
+        return [Path(configured).expanduser()]
+    if _is_multiplex_active():
+        return []
+    try:
+        return sorted(_DEFAULT_CREDENTIALS_DIR.glob("*credentials*.json"))
+    except OSError:
+        return []
+
+
+def _resolve_credentials_data(extra: Optional[dict] = None) -> dict:
+    """Load the first credential record containing a private key."""
+    for path in _credentials_candidates(extra):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         if not isinstance(data, dict):
             continue
-        for field in ("nsec", "private_key_hex", "private_key"):
-            value = data.get(field)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        if any(isinstance(data.get(field), str) and data[field].strip() for field in ("nsec", "private_key_hex", "private_key")):
+            return data
+    return {}
+
+
+def _resolve_private_key(extra: Optional[dict] = None) -> str:
+    """Resolve the Nostr private key: scoped secret first, then credentials JSON.
+
+    NEVER log the return value.
+    """
+    key = str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip()
+    if key:
+        return key
+    data = _resolve_credentials_data(extra)
+    for field in ("nsec", "private_key_hex", "private_key"):
+        value = data.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""
+
+
+def _resolve_auth_tag(extra: Optional[dict] = None) -> str:
+    """Resolve and validate the optional NIP-OA owner-attestation tag."""
+    configured = str(_get_scoped_secret("BUZZ_AUTH_TAG", "") or "").strip()
+    if configured:
+        raw: Any = configured
+    else:
+        credentials_file = str(_get_scoped_secret("BUZZ_CREDENTIALS_FILE", "") or "").strip() or str(
+            (extra or {}).get("credentials_file", "") or ""
+        ).strip()
+        direct_key = str(_get_scoped_secret("BUZZ_PRIVATE_KEY", "") or "").strip()
+        if direct_key and not credentials_file:
+            return ""
+        data = _resolve_credentials_data(extra)
+        if "auth_tag" not in data:
+            return ""
+        raw = data["auth_tag"]
+
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Buzz auth tag is not valid JSON") from exc
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 4
+        or raw[0] != "auth"
+        or not all(isinstance(part, str) for part in raw)
+    ):
+        raise ValueError("Buzz auth tag must be a four-string auth tag")
+    return json.dumps(raw, separators=(",", ":"))
 
 
 async def _exec_buzz(
@@ -317,6 +473,7 @@ async def _exec_buzz(
     *,
     relay_url: str,
     private_key: str,
+    auth_tag: str = "",
     input_text: Optional[str] = None,
     timeout: float = _CLI_TIMEOUT,
 ) -> Tuple[int, str, str]:
@@ -329,6 +486,9 @@ async def _exec_buzz(
     env = os.environ.copy()
     env["BUZZ_RELAY_URL"] = relay_url
     env["BUZZ_PRIVATE_KEY"] = private_key
+    env.pop("BUZZ_AUTH_TAG", None)
+    if auth_tag:
+        env["BUZZ_AUTH_TAG"] = auth_tag
     proc = await asyncio.create_subprocess_exec(
         cli_path,
         *args,
@@ -378,6 +538,38 @@ def _parse_json_list(stdout: str) -> List[dict]:
     if not isinstance(data, list):
         return []
     return [item for item in data if isinstance(item, dict)]
+
+
+def _event_reply_parent_id(event: dict) -> Optional[str]:
+    """Resolve a chat event's direct parent event id (NIP-10 ``e`` tags).
+
+    Prefer a ``reply``-marked tag, then a ``root``-marked tag, else the last
+    positional ``e`` tag. Buzz Desktop thread replies typically carry both
+    root and reply markers; the reply marker is the direct parent.
+    """
+    tags = event.get("tags")
+    if not isinstance(tags, list):
+        return None
+    reply_id: Optional[str] = None
+    root_id: Optional[str] = None
+    last_e: Optional[str] = None
+    for tag in tags:
+        if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "e":
+            continue
+        target = str(tag[1] or "").strip()
+        if not target:
+            continue
+        marker = str(tag[3] or "") if len(tag) > 3 else ""
+        last_e = target
+        if marker == "reply":
+            reply_id = target
+        elif marker == "root":
+            root_id = target
+    return reply_id or root_id or last_e
+
+
+# Cap stored parent content snippets (gateway reply injection also clips).
+_EVENT_META_CONTENT_CAP = 500
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +628,23 @@ class BuzzAdapter(BasePlatformAdapter):
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
 
+        # Reply anchoring: "first"/"all" thread the reply onto the parent event
+        # id, "off" posts every reply as a normal top-level channel message.
+        # Mirrors the Discord/Telegram adapters, which already honor this
+        # PlatformConfig field; without it Buzz threaded unconditionally.
+        # Env (BUZZ_REPLY_TO_MODE) overrides config.yaml.
+        _rtm = (os.getenv("BUZZ_REPLY_TO_MODE") or getattr(config, "reply_to_mode", "first")
+                or "first")
+        self._reply_to_mode: str = str(_rtm).strip().lower()
+        # Slack-convention alias: platforms.buzz.extra.reply_in_thread: false
+        # (the key users already know from Slack) opts out of threading the
+        # same way reply_to_mode: off does. Env (BUZZ_REPLY_IN_THREAD)
+        # overrides config.yaml. See #95842 / #75082.
+        _rit_raw = os.getenv("BUZZ_REPLY_IN_THREAD")
+        _rit = extra.get("reply_in_thread") if _rit_raw is None else _rit_raw
+        if _rit is not None and str(_rit).strip().lower() in ("false", "0", "no", "off"):
+            self._reply_to_mode = "off"
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
@@ -458,10 +667,28 @@ class BuzzAdapter(BasePlatformAdapter):
             if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
         }
 
+        # Verified local-agent identities may acknowledge explicit tags without
+        # gaining prompt/dispatch authority. This keeps the human allow-list
+        # intact while providing receipt visibility for agent-authored notes.
+        # If a pubkey appears in both sets, allowed_users takes precedence: the
+        # normal authorized dispatch path runs and this reaction-only path does not.
+        raw_reaction_only = (
+            os.getenv("BUZZ_REACTION_ONLY_USERS")
+            or extra.get("reaction_only_users", [])
+        )
+        if isinstance(raw_reaction_only, str):
+            raw_reaction_only = raw_reaction_only.split(",")
+        self._reaction_only_pubkeys: set = {
+            normalized
+            for entry in raw_reaction_only
+            if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
+        }
+
         # Secret — resolved lazily (never at import/registration time and
         # never logged).  connect() re-resolves it to fail fast with a clear
         # error when it is missing.
         self._private_key: str = ""
+        self._auth_tag: str = ""
 
         # Identity — filled in by connect() from ``buzz users get``
         self._self_pubkey: str = ""
@@ -472,10 +699,18 @@ class BuzzAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
+        self._presence_task: Optional[asyncio.Task] = None
+        self._presence_interval = _PRESENCE_INTERVAL
         self._ws_active = False  # True while the WS loop owns inbound delivery
         self._membership_since = 0
         self._lock_key: Optional[str] = None
-        # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
+        # channel_id -> {
+        #   "chat_type", "last_ts",
+        #   "seen": OrderedDict[event_id, None],
+        #   "event_meta": OrderedDict[event_id, (author_pubkey, content_snippet)],
+        # }
+        # event_meta backs NIP-10 reply-parent resolution for require_mention
+        # (thread replies to our own messages count as addressed — #75826).
         self._channel_state: Dict[str, dict] = {}
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
@@ -483,6 +718,37 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
         self._poll_count = 0
+        # inbound event_id -> thread root event id, or None when that message
+        # was itself top-level.  Lets send() mirror the user's own threading
+        # instead of opening a new thread under every reply (see _thread_root).
+        self._thread_roots: "OrderedDict[str, Optional[str]]" = OrderedDict()
+
+        # ── Reaction lifecycle (👀 received → 🧠 working → ✅/❌) ──────────
+        # Best-effort visible progress: Buzz has no typing-indicator API, so
+        # reactions are the only pre-reply surface. Config gate:
+        #   gateway.platforms.buzz.extra.reactions (default true)
+        # Deliberately NOT an env var — behavioral config belongs in
+        # config.yaml (profile-scoped, so multiplex profiles stay isolated).
+        reactions_raw = extra.get("reactions", True)
+        if isinstance(reactions_raw, bool):
+            self._reactions_enabled_flag = reactions_raw
+        else:
+            _text = str(reactions_raw).strip().lower()
+            if _text in ("true", "1", "yes", "on"):
+                self._reactions_enabled_flag = True
+            elif _text in ("false", "0", "no", "off"):
+                self._reactions_enabled_flag = False
+            else:
+                logger.warning(
+                    "Buzz: invalid reactions value %r in platforms.buzz.extra; "
+                    "using default true",
+                    reactions_raw,
+                )
+                self._reactions_enabled_flag = True
+        # (chat_id, message_id) -> {"emoji": str|None, "terminal": bool,
+        # "tail_task": asyncio.Task|None}
+        self._reaction_lifecycle: Dict[tuple, dict] = {}
+        self._reaction_tasks: set = set()
 
     @property
     def name(self) -> str:
@@ -504,13 +770,58 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
         if not self._private_key:
             self._private_key = _resolve_private_key(self._extra)
+            self._auth_tag = _resolve_auth_tag(self._extra)
         return await _exec_buzz(
             self.cli_path,
             args,
             relay_url=self.relay_url,
             private_key=self._private_key,
+            auth_tag=self._auth_tag,
             input_text=input_text,
         )
+
+    async def _set_presence(self, status: str) -> bool:
+        """Publish a best-effort presence state to the Buzz relay."""
+        try:
+            code, _out, err = await self._run_cli(
+                ["users", "set-presence", "--status", status]
+            )
+        except Exception as exc:
+            logger.debug("Buzz: presence update to %s failed — %s", status, exc)
+            return False
+        if code != 0:
+            logger.debug(
+                "Buzz: presence update to %s failed — %s",
+                status,
+                _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    async def _presence_loop(self) -> None:
+        """Refresh online presence until the adapter disconnects."""
+        try:
+            while True:
+                await asyncio.sleep(self._presence_interval)
+                await self._set_presence("online")
+        except asyncio.CancelledError:
+            raise
+
+    async def _start_presence(self) -> None:
+        """Publish online presence and start its expiry-refresh task."""
+        await self._set_presence("online")
+        self._presence_task = asyncio.create_task(self._presence_loop())
+
+    async def _stop_presence(self) -> None:
+        """Stop refreshing and publish offline presence best-effort."""
+        if self._presence_task and not self._presence_task.done():
+            self._presence_task.cancel()
+            await asyncio.gather(self._presence_task, return_exceptions=True)
+        self._presence_task = None
+        try:
+            await asyncio.wait_for(self._set_presence("offline"), timeout=5)
+        except (asyncio.TimeoutError, TimeoutError, Exception):
+            pass  # best-effort: never let presence block shutdown
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
@@ -524,7 +835,13 @@ class BuzzAdapter(BasePlatformAdapter):
             logger.error("Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)")
             self._set_fatal_error("cli_missing", "buzz CLI binary not found", retryable=False)
             return False
-        self._private_key = _resolve_private_key(self._extra)
+        try:
+            self._private_key = _resolve_private_key(self._extra)
+            self._auth_tag = _resolve_auth_tag(self._extra)
+        except ValueError as exc:
+            logger.error("Buzz: invalid owner-auth configuration — %s", exc)
+            self._set_fatal_error("config_invalid", str(exc), retryable=False)
+            return False
         if not self._private_key:
             logger.error("Buzz: no private key (set BUZZ_PRIVATE_KEY or a credentials file)")
             self._set_fatal_error("config_missing", "BUZZ_PRIVATE_KEY must be set", retryable=False)
@@ -614,6 +931,8 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
+        # Publish online presence and refresh it against relay expiry.
+        await self._start_presence()
         self._mark_connected()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
@@ -654,10 +973,410 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        # Presence: stop refreshing, then publish offline best-effort. A
+        # failed publish must not break shutdown (relay may already be gone).
+        await self._stop_presence()
+        # Reaction lifecycle: cancel any in-flight transition tasks so
+        # shutdown never leaks "task pending" warnings or hangs on a wedged
+        # buzz-cli call.
+        pending = [t for t in self._reaction_tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._reaction_tasks.clear()
+        self._reaction_lifecycle = {}
         self._channel_state = {}
         self._poll_count = 0
 
+    async def remove_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Remove our emoji reaction from a message via buzz-cli.
+
+        Mirrors :meth:`send_reaction`: best-effort, returns True/False, never
+        raises into the message flow. Requires the exact emoji because the
+        CLI contract is ``reactions remove --event <id> --emoji <e>``.
+        """
+        if not self.cli_path or not emoji or not message_id:
+            return False
+        args = [
+            "reactions", "remove",
+            "--event", str(message_id),
+            "--emoji", emoji,
+        ]
+        try:
+            code, _out, err = await self._run_cli(args)
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
+        if code != 0:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    # ── Reaction lifecycle coordinator ────────────────────────────────────
+    #
+    # Buzz has no typing-indicator API, so reactions are the only visible
+    # pre-reply progress. State machine per inbound message, keyed
+    # (chat_id, message_id): 👀 queued at dispatch → 🧠 when background
+    # processing starts → ✅/❌ on the real outcome (CANCELLED removes the
+    # working reaction and adds nothing). Transitions are serialized per
+    # message behind a tail task so hooks can fire out of order / early
+    # without stacking or racing reactions on the relay, and every buzz-cli
+    # call happens in a background task — never awaited by message
+    # processing or response delivery. Best-effort throughout: any failure
+    # only means the user sees a stale emoji, never a broken reply.
+
+    _RECEIVED_EMOJI = "\N{EYES}"
+    _WORKING_EMOJI = "\N{BRAIN}"
+    _OK_EMOJI = "\N{WHITE HEAVY CHECK MARK}"
+    _FAIL_EMOJI = "\N{CROSS MARK}"
+
+    def _reactions_enabled(self) -> bool:
+        """Config gate: platforms.buzz.extra.reactions (default true)."""
+        return self._reactions_enabled_flag
+
+    def _reaction_begin(self, chat_id: str, message_id: str) -> None:
+        """Create lifecycle state and queue the 👀 transition (non-blocking)."""
+        key = (chat_id, message_id)
+        if key in self._reaction_lifecycle:
+            return
+        self._reaction_lifecycle[key] = {
+            "emoji": None, "terminal": False, "tail_task": None,
+        }
+        self._reaction_transition_enqueue(key, self._RECEIVED_EMOJI)
+
+    def _reaction_transition_enqueue(
+        self, key: tuple, desired: Optional[str], *, terminal: bool = False
+    ) -> None:
+        """Queue a transition behind the current tail; returns immediately.
+
+        ``terminal=True`` marks the lifecycle finished. The transition still
+        runs (chained behind its predecessors), but no further transitions
+        may be enqueued and the terminal task drops the lifecycle state when
+        it completes.
+        """
+        state = self._reaction_lifecycle.get(key)
+        if state is None or state["terminal"]:
+            return
+        if terminal:
+            state["terminal"] = True
+        task = asyncio.create_task(
+            self._reaction_transition_run(
+                key, desired, state.get("tail_task"), terminal
+            )
+        )
+        state["tail_task"] = task
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _reaction_transition_run(
+        self,
+        key: tuple,
+        desired: Optional[str],
+        prev: Optional[asyncio.Task],
+        terminal: bool,
+    ) -> None:
+        """Serialized remove-gated replacement; see block comment above."""
+        try:
+            if prev is not None:
+                try:
+                    await prev
+                except asyncio.CancelledError:
+                    # Shutdown cancelled the chain ahead of us — stop here.
+                    raise
+                except Exception:
+                    pass  # predecessor failed; best-effort chain continues
+            state = self._reaction_lifecycle.get(key)
+            if state is None:
+                return
+            chat_id, message_id = key
+            current = state["emoji"]
+            if desired != current:
+                if current is not None:
+                    if not await self.remove_reaction(chat_id, message_id, current):
+                        # Keep the old reaction authoritative; skip the add
+                        # so two lifecycle reactions never stack on the relay.
+                        return
+                    state["emoji"] = None
+                if desired is not None and await self.send_reaction(
+                    chat_id, message_id, desired
+                ):
+                    state["emoji"] = desired
+        finally:
+            if terminal:
+                # The terminal task is the chain's last link (later enqueues
+                # are rejected), so dropping the state here cannot orphan a
+                # queued transition. Best-effort end regardless of I/O result.
+                self._reaction_lifecycle.pop(key, None)
+
+    def _reaction_eligible(self, event: MessageEvent) -> bool:
+        """True when this turn should carry lifecycle reactions.
+
+        Requires message ids, an enabled gate, a conversational (non-command)
+        message, and — when a gateway authorization callback is installed —
+        a positive authorization for the sender. ``on_processing_start`` runs
+        before the runner's central authorization check, so without this
+        gate unauthorized senders would earn a 👀 they can see.
+        """
+        if not getattr(event, "message_id", None):
+            return False
+        if not self._reactions_enabled():
+            return False
+        if not isinstance(getattr(event, "text", None), str) or event.is_command():
+            return False
+        user_id = getattr(event.source, "user_id", None)
+        if user_id and self._authorization_check is not None:
+            decision = self._is_sender_authorized(
+                user_id,
+                chat_type=getattr(event.source, "chat_type", None),
+                chat_id=getattr(event.source, "chat_id", None),
+            )
+            if decision is False:
+                return False
+        return True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """👀 → 🧠 when background processing of the message begins."""
+        key = (
+            getattr(event.source, "chat_id", None),
+            getattr(event, "message_id", None),
+        )
+        if key in self._reaction_lifecycle:
+            self._reaction_transition_enqueue(key, self._WORKING_EMOJI)
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """🧠 → ✅/❌ on the real outcome; CANCELLED removes and adds nothing."""
+        key = (
+            getattr(event.source, "chat_id", None),
+            getattr(event, "message_id", None),
+        )
+        if key not in self._reaction_lifecycle:
+            return
+        if outcome == ProcessingOutcome.SUCCESS:
+            desired = self._OK_EMOJI
+        elif outcome == ProcessingOutcome.FAILURE:
+            desired = self._FAIL_EMOJI
+        else:
+            desired = None  # CANCELLED: remove current, add no terminal.
+        self._reaction_transition_enqueue(key, desired, terminal=True)
+
     # ── Sending ───────────────────────────────────────────────────────────
+
+    async def _channel_member_pubkeys(self, chat_id: str) -> List[str]:
+        """Candidate pubkeys for mention resolution, membership-accurate.
+
+        Primary source is ``channels members`` — the relay's membership
+        contract — because a ``--mention`` for a non-member makes the CLI
+        reject the whole publish.  CLIs without that subcommand fall back
+        to harvesting recent channel traffic (authors plus prior mention
+        tags), which can over-approximate; ``send()`` recovers from any
+        resulting non-member mention by retrying without mention flags.
+
+        The member list is cached per channel for ``_MEMBER_CACHE_TTL``
+        seconds so a chatty agent doesn't pay a CLI round-trip on every
+        publish; membership drift inside the TTL window is covered by the
+        same ``send()`` recovery retry.
+        """
+        cache: Dict[str, Tuple[float, List[str]]] = getattr(
+            self, "_member_cache", {}
+        )
+        self._member_cache = cache
+        cached = cache.get(str(chat_id))
+        if cached is not None and (time.monotonic() - cached[0]) < _MEMBER_CACHE_TTL:
+            return list(cached[1])
+        code, out, _err = await self._run_cli(
+            ["channels", "members", "--channel", str(chat_id)]
+        )
+        if code == 0:
+            pks: List[str] = []
+            try:
+                rows = json.loads(out or "[]")
+            except ValueError:
+                rows = []
+            for row in rows:
+                pk = row.get("pubkey") if isinstance(row, dict) else row
+                pk = str(pk or "").lower()
+                if pk and pk not in pks:
+                    pks.append(pk)
+            if pks:
+                cache[str(chat_id)] = (time.monotonic(), list(pks))
+                return pks
+        candidates: List[str] = []
+        code, out, _err = await self._run_cli(
+            ["messages", "get", "--channel", str(chat_id), "--limit", "50"]
+        )
+        if code == 0:
+            try:
+                for msg in json.loads(out or "[]"):
+                    pk = str(msg.get("pubkey") or "").lower()
+                    if pk and pk not in candidates:
+                        candidates.append(pk)
+                    for t in msg.get("tags") or []:
+                        if isinstance(t, list) and len(t) > 1 and t[0] == "p":
+                            tpk = str(t[1]).lower()
+                            if tpk and tpk not in candidates:
+                                candidates.append(tpk)
+            except ValueError:
+                pass
+        if candidates:
+            cache[str(chat_id)] = (time.monotonic(), list(candidates))
+        return candidates
+
+    async def _profile_display_name(self, pubkey: str) -> str:
+        """Display name for *pubkey* via ``users get --pubkey``, cached.
+
+        Bare ``users get`` may return only our own profile
+        (relay-dependent), so lookups are per-pubkey.  Entries expire after
+        ``_PROFILE_NAME_TTL`` seconds so a renamed member resolves under
+        their new display name without a process restart.
+        """
+        cache: Dict[str, Tuple[float, str]] = getattr(
+            self, "_profile_name_cache", {}
+        )
+        self._profile_name_cache = cache
+        cached = cache.get(pubkey)
+        if cached is not None and (time.monotonic() - cached[0]) < _PROFILE_NAME_TTL:
+            return cached[1]
+        name = ""
+        code, out, _err = await self._run_cli(["users", "get", "--pubkey", pubkey])
+        if code == 0:
+            try:
+                profiles = json.loads(out or "[]")
+            except ValueError:
+                profiles = []
+            if profiles and isinstance(profiles[0], dict):
+                p0 = profiles[0]
+                name = str(p0.get("display_name") or p0.get("name") or "").strip()
+                if not name and p0.get("content"):
+                    try:
+                        prof = json.loads(p0["content"])
+                        name = str(
+                            prof.get("display_name") or prof.get("name") or ""
+                        ).strip()
+                    except ValueError:
+                        pass
+        cache[pubkey] = (time.monotonic(), name)
+        return name
+
+    async def _mention_pubkeys_for(self, chat_id: str, content: str) -> List[str]:
+        """Resolve ``@Name`` references in *content* to member pubkeys.
+
+        The CLI hard-fails a publish when any @token fails to resolve to a
+        current member, and LLM prose is full of @-shaped tokens — including
+        real mentions with trailing punctuation ("@Riley!!") the CLI's own
+        parser rejects.  Passing explicit ``--mention`` pubkeys for every
+        member name we find keeps genuine mentions notifying (p-tags intact)
+        while downgrading everything unresolvable to presentation-only text.
+
+        Matching is mention-token semantics, not substring, bounded on both
+        sides with Unicode-aware word classes: the ``@`` must start a token
+        ("email@Fizz", "x@Fizz", "@@Fizz", and "山田@Fizz" do NOT wake
+        Fizz) and the name must be followed by a non-word character or
+        end-of-text ("@Riley!!" tags Riley; "@FizzBuzz" does NOT tag a
+        member named Fizz).  Longer names match first and consume their
+        span, so "@Hermes Matt" prefers the member "Hermes Matt" over a
+        member "Hermes".
+
+        Duplicate display names are ambiguous: the span is consumed but no
+        one is tagged (presentation-only), mirroring how Buzz treats
+        ambiguous names — never pick an arbitrary member.
+        """
+        if "@" not in content:
+            return []
+        by_name: Dict[str, List[str]] = {}
+        display: Dict[str, str] = {}
+        self_pk = getattr(self, "_self_pubkey", None)
+        for pk in await self._channel_member_pubkeys(chat_id):
+            if pk == self_pk:
+                continue
+            name = await self._profile_display_name(pk)
+            if not name:
+                continue
+            key = name.lower()
+            by_name.setdefault(key, [])
+            if pk not in by_name[key]:
+                by_name[key].append(pk)
+            display.setdefault(key, name)
+        found: List[str] = []
+        text = content
+        for key in sorted(by_name, key=len, reverse=True):
+            pattern = re.compile(
+                r"(?<![\w@])@" + re.escape(display[key]) + r"(?!\w)",
+                re.IGNORECASE,
+            )
+            if pattern.search(text):
+                pks = by_name[key]
+                if len(pks) == 1 and pks[0] not in found:
+                    found.append(pks[0])
+                # Consume the span either way: a shorter member name that is
+                # a prefix of this one must not double-match, and an
+                # ambiguous name must stay presentation-only rather than
+                # falling through to a partial match.
+                text = pattern.sub("\x00", text)
+        return found
+
+    async def _run_message_send(
+        self,
+        args: List[str],
+        content: str,
+        mention_pubkeys: Optional[List[str]] = None,
+    ):
+        """Run one send with bounded mention-failure recovery.
+
+        Ladder (each rung fires at most once):
+
+        1. publish with explicit ``--mention`` pubkeys resolved from the
+           content (#83414) so genuine member mentions carry p-tags and
+           mention-subscribed agents actually wake;
+        2. if the CLI rejects because a resolved pubkey is no longer a
+           member (membership drift), retry without the explicit mentions —
+           deliver the message rather than lose it;
+        3. if the CLI's preflight rejects an unresolvable presentation
+           ``@token`` in prose, escape exactly that token with an invisible
+           separator and retry (#82646 / #78797);
+        4. if the error persists and we know our own pubkey, retry once with
+           ``--mention <self>`` — supplying any explicit identity downgrades
+           unresolvable @names to presentation-only text (#83414); the echo
+           de-dupe already suppresses self-notification.
+        """
+        mention_args: List[str] = []
+        for pk in mention_pubkeys or []:
+            mention_args += ["--mention", pk]
+        code, out, err = await self._run_cli(args + mention_args, input_text=content)
+        if code == 0:
+            return code, out, err
+        if mention_args and "not channel members" in (err or ""):
+            # Membership drifted between resolution and publish (or the
+            # fallback candidate source over-approximated): never let a
+            # stale mention kill the message.
+            code, out, err = await self._run_cli(args, input_text=content)
+            if code == 0:
+                return code, out, err
+        escaped = _escape_unresolved_presentation_mention(content, err)
+        if escaped is not None:
+            logger.info(
+                "Buzz: retrying message after unresolved presentation-mention preflight"
+            )
+            code, out, err = await self._run_cli(args, input_text=escaped)
+            if code == 0:
+                return code, out, err
+        if (
+            code != 0
+            and "does not match a current channel member" in (err or "")
+            and getattr(self, "_self_pubkey", None)
+        ):
+            code, out, err = await self._run_cli(
+                args + ["--mention", self._self_pubkey], input_text=content
+            )
+        return code, out, err
 
     async def send(
         self,
@@ -669,10 +1388,18 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
-        if reply_target:
+        # Prefer the stable thread anchor from metadata.thread_id (Slack-style),
+        # then metadata.reply_to_message_id (gateway stream consumer /
+        # progress sends), then the explicit reply_to argument.  Without
+        # reply_to_message_id, interim commentary posts flat in the channel.
+        meta = metadata or {}
+        reply_target = self._resolve_reply_anchor(
+            meta.get("thread_id") or meta.get("reply_to_message_id") or reply_to
+        )
+        if reply_target and self._reply_to_mode != "off":
             args += ["--reply-to", str(reply_target)]
-        code, out, err = await self._run_cli(args, input_text=content)
+        mention_pubkeys = await self._mention_pubkeys_for(chat_id, content)
+        code, out, err = await self._run_message_send(args, content, mention_pubkeys)
         if code != 0:
             return SendResult(
                 success=False,
@@ -687,7 +1414,12 @@ class BuzzAdapter(BasePlatformAdapter):
         if event_id:
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
+            # Also record event_meta so a thread reply to this send matches
+            # even if the WS/poll echo never arrives (#75826).
             self._mark_seen(str(chat_id), str(event_id))
+            self._remember_event_meta(
+                str(chat_id), str(event_id), self._self_pubkey, content
+            )
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
@@ -715,7 +1447,14 @@ class BuzzAdapter(BasePlatformAdapter):
             "--event", str(message_id),
             "--emoji", emoji,
         ]
-        code, _out, err = await self._run_cli(args)
+        try:
+            code, _out, err = await self._run_cli(args)
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction add failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
         if code != 0:
             logger.debug(
                 "Buzz: reaction add failed for message %s in %s — %s",
@@ -723,6 +1462,81 @@ class BuzzAdapter(BasePlatformAdapter):
             )
             return False
         return True
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a previously sent message.
+
+        Implementing this is what lets the gateway stream a reply on Buzz: the
+        stream consumer sends a first partial message and then re-edits that one
+        message as tokens arrive.  Without it the adapter inherits the base
+        stub, which returns ``success=False``, and the whole answer is delivered
+        in one block when the turn finishes.
+
+        ``buzz-cli`` reports a NEW event id for the edit itself, but the edit
+        TARGET stays the original id, and the stream consumer holds a single
+        ``message_id`` across the whole stream.  So this returns the id it was
+        given, not the one the CLI reports; returning the CLI's id would make
+        every edit after the first address a message that was never sent.
+
+        ``finalize`` is a no-op here.  Buzz edits carry no lifecycle state, the
+        same as Telegram, Slack and Discord.
+        """
+        if not message_id:
+            return SendResult(success=False, error="Buzz edit needs a message id")
+        if not content:
+            return SendResult(success=False, error="Empty message")
+        args = ["messages", "edit", "--event", str(message_id), "--content", "-"]
+        code, out, err = await self._run_cli(args, input_text=content)
+        if code != 0:
+            return SendResult(
+                success=False,
+                error=_cli_error_message(err, code),
+                retryable=code == 2,
+            )
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            data = {}
+        edit_event_id = data.get("event_id")
+        if edit_event_id:
+            # The edit is itself an event on the relay and comes back on our own
+            # subscription; mark it seen so the de-dupe does not treat our own
+            # edit as inbound traffic.
+            self._mark_seen(str(chat_id), str(edit_event_id))
+        return SendResult(
+            success=bool(data.get("accepted", True)),
+            message_id=str(message_id),
+            raw_response=data,
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent message.
+
+        Used by the stream consumer's fresh-final cleanup path, which replaces a
+        long-lived preview with a completed reply rather than editing in place.
+        """
+        if not message_id:
+            return False
+        code, out, _err = await self._run_cli(
+            ["messages", "delete", "--event", str(message_id)]
+        )
+        if code != 0:
+            return False
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            return True
+        event_id = data.get("event_id")
+        if event_id:
+            self._mark_seen(str(chat_id), str(event_id))
+        return bool(data.get("accepted", True))
 
     async def send_image(
         self,
@@ -741,9 +1555,12 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
-            code, out, err = await self._run_cli(args, input_text=caption or "")
+            reply_target = self._resolve_reply_anchor(
+                (metadata or {}).get("thread_id") or reply_to
+            )
+            if reply_target and self._reply_to_mode != "off":
+                args += ["--reply-to", str(reply_target)]
+            code, out, err = await self._run_message_send(args, caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
             try:
@@ -753,6 +1570,12 @@ class BuzzAdapter(BasePlatformAdapter):
             event_id = data.get("event_id")
             if event_id:
                 self._mark_seen(str(chat_id), str(event_id))
+                self._remember_event_meta(
+                    str(chat_id),
+                    str(event_id),
+                    self._self_pubkey,
+                    caption or "",
+                )
             return SendResult(
                 success=bool(data.get("accepted", True)),
                 message_id=str(event_id) if event_id else None,
@@ -835,12 +1658,21 @@ class BuzzAdapter(BasePlatformAdapter):
         # multiplex profile a missing tag fails closed to "" instead of
         # attaching the default profile's tag from os.environ, while
         # single-profile and unscoped default-profile reads keep the legacy
-        # env behavior (the wrapper falls back to os.environ there).
+        # env behavior. connect() populates ``self._auth_tag`` via
+        # ``_resolve_auth_tag`` (scope-aware read + credentials-file
+        # fallback, #79514); resolve lazily here as well so a re-auth on a
+        # bare adapter stays scope-correct.
+        auth_tag = getattr(self, "_auth_tag", "") or ""
+        if not auth_tag:
+            try:
+                auth_tag = _resolve_auth_tag(getattr(self, "_extra", None))
+            except ValueError:
+                auth_tag = ""
         event = build_auth_event(
             private_key=self._private_key,
             challenge=str(message[1]),
             relay_url=self._websocket_url(),
-            auth_tag_json=_get_scoped_secret("BUZZ_AUTH_TAG", "") or "",
+            auth_tag_json=auth_tag,
         )
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
@@ -862,7 +1694,7 @@ class BuzzAdapter(BasePlatformAdapter):
         request = [
             "REQ",
             subscription_id,
-            {"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since},
+            {"kinds": sorted(_DISPATCH_KINDS), "#h": [channel_id], "since": since},
         ]
         await websocket.send(json.dumps(request, separators=(",", ":")))
 
@@ -984,9 +1816,17 @@ class BuzzAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             raise
 
+    def _new_channel_state(self, chat_type: str) -> dict:
+        return {
+            "chat_type": chat_type,
+            "last_ts": 0,
+            "seen": OrderedDict(),
+            "event_meta": OrderedDict(),
+        }
+
     async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
         """Initialize a channel's high-water mark from its newest events."""
-        state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
+        state = self._new_channel_state(chat_type)
         self._channel_state[channel_id] = state
         code, out, err = await self._run_cli(
             ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
@@ -1005,6 +1845,10 @@ class BuzzAdapter(BasePlatformAdapter):
             if event_id:
                 state["seen"][str(event_id)] = None
             state["last_ts"] = max(state["last_ts"], created_at)
+            # History is never dispatched, but it still classifies and feeds
+            # the event_meta cache so post-restart thread replies to messages
+            # we sent before the gateway came up still match (#75826).
+            self._remember_event(state, event)
             # History is never dispatched, but it still classifies: a DM that
             # leaked in via ``channels list`` latches to chat_type="dm" here,
             # so it bypasses the mention gate from the very first poll.
@@ -1019,10 +1863,8 @@ class BuzzAdapter(BasePlatformAdapter):
         ``dms list`` is only a best-effort source: on some hosted relays it
         returns ``[]`` even when DM conversations exist (#68871).  Those DMs
         DO surface in ``channels list`` as entries named "DM" with an empty
-        description, so that listing is scanned as a fallback.  Fallback
-        finds are watched as ``group`` and latch to ``dm`` via p-tag
-        detection (_is_direct_message_event) rather than trusting the name
-        alone to unlock the mention-free DM path.
+        description, so that exact metadata shape is the fallback.  Named
+        rooms and missing metadata still fail closed as groups.
         """
         code, out, _err = await self._run_cli(["dms", "list"])
         if code == 0:
@@ -1033,7 +1875,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 if seed:
                     await self._seed_channel(dm_id, chat_type="dm")
                 else:
-                    self._channel_state[dm_id] = {"chat_type": "dm", "last_ts": 0, "seen": OrderedDict()}
+                    self._channel_state[dm_id] = self._new_channel_state("dm")
                 self._channel_names.setdefault(dm_id, "DM")
 
         code, out, _err = await self._run_cli(["channels", "list"])
@@ -1045,12 +1887,15 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             self._channel_meta[ch_id] = ch
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
-            if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
+            if not self._may_reclassify_as_dm(ch_id):
+                continue
+            if ch_id in self._channel_state:
+                self._channel_state[ch_id]["chat_type"] = "dm"
                 continue
             if seed:
-                await self._seed_channel(ch_id, chat_type="group")
+                await self._seed_channel(ch_id, chat_type="dm")
             else:
-                self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+                self._channel_state[ch_id] = self._new_channel_state("dm")
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
@@ -1080,12 +1925,16 @@ class BuzzAdapter(BasePlatformAdapter):
         state["seen"][event_id] = None
         state["last_ts"] = max(state["last_ts"], created_at)
 
-        if int(event.get("kind") or 0) != _CHAT_KIND:
+        if int(event.get("kind") or 0) not in _DISPATCH_KINDS:
             return
         pubkey = str(event.get("pubkey") or "").lower()
         content = event.get("content")
         if not pubkey or not isinstance(content, str) or not content.strip():
             return
+
+        # Feed the per-channel event cache before any early return so self-echo
+        # and concurrent-author traffic can still be reply parents (#75826).
+        self._remember_event(state, event)
 
         # Suppress self-echo: never dispatch our own messages back to the agent.
         if pubkey == self._self_pubkey:
@@ -1096,15 +1945,42 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
+        reply_parent_id = _event_reply_parent_id(event)
+        reply_meta = self._lookup_event_meta(state, reply_parent_id) if reply_parent_id else None
+        reply_to_is_own = bool(
+            reply_meta is not None and reply_meta[0] == self._self_pubkey
+        )
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        # A NIP-10 thread reply whose direct parent is one of our messages is
+        # treated as addressed (parity with Signal/WhatsApp; fixes #75826 —
+        # e.g. Desktop "/approve session" replies that never type @name).
+        # Explicit addressing is a text @mention OR a signed recipient p-tag
+        # (#92781). DMs always dispatch.
+        if (
+            not is_dm
+            and self.require_mention
+            and not self._is_addressed(event)
+            and not reply_to_is_own
+        ):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
         # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
+            explicitly_tagged = any(
+                isinstance(tag, (list, tuple))
+                and len(tag) > 1
+                and tag[0] == "p"
+                and str(tag[1]).lower() == self._self_pubkey
+                for tag in event.get("tags") or []
+            )
+            if (
+                pubkey in self._reaction_only_pubkeys
+                and explicitly_tagged
+                and self._is_mentioned(content)
+            ):
+                await self.send_reaction(channel_id, event_id, "👀")
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
 
@@ -1113,6 +1989,14 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
+        # NIP-10 thread root for session scoping: replies inside a thread all
+        # share the root as their thread_id, so the gateway groups them into
+        # one thread session (marked "root" tag preferred, legacy fallback).
+        thread_id = self._extract_thread_root(event)
+
+        # Remember where this message sits in the thread graph so our reply
+        # can join the SAME thread rather than nesting a new one under it.
+        self._record_thread_root(event_id, event)
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1122,48 +2006,52 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=thread_id,
+            reply_to_message_id=reply_parent_id,
+            reply_to_text=reply_meta[1] if reply_meta else None,
+            reply_to_author_id=reply_meta[0] if reply_meta else None,
+            reply_to_is_own_message=reply_to_is_own,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
     #
     # ``buzz dms list`` returns [] on some hosted relays even when DM
-    # conversations exist, so DMs leak in via ``channels list`` and get
-    # watched as chat_type="group" — which wrongly puts them behind the
-    # channel mention gate.  Classification therefore keys off the Nostr
-    # tags of the messages themselves.  Observed on a live hosted relay:
-    #
-    #   * every message another user sends IN A DM carries a structural
-    #     ["p", <our pubkey>] tag, even when the text never mentions us
-    #     (recipient addressing);
-    #   * in a real channel, a ["p", <our pubkey>] tag appears only when the
-    #     text visibly @mentions us (typed mention, with or without a reply
-    #     ["e", ...] tag) — never on plain broadcasts.
-    #
-    # So "p-tagged to self WITHOUT a visible mention in the content" is the
-    # DM discriminator: in a channel that combination does not occur, and a
-    # channel reply/mention that p-tags us is excluded because the mention
-    # is right there in the text.  As a second, independent guard, a
-    # conversation whose ``channels list`` metadata looks like a real
-    # community channel (real name / non-empty description) is never
-    # reclassified at all, whereas relay-materialized DMs are always named
-    # "DM" with an empty description.  Nothing is lost while unlatched: a
-    # DM message that DOES mention us dispatches through the mention gate
-    # anyway, so the latch flips exactly on the first message that needs it.
+    # conversations exist, so DMs can leak in through ``channels list`` as
+    # chat_type="group".  Relay-materialized DMs are named "DM" with an empty
+    # description, which periodic discovery promotes to DM even when messages
+    # omit recipient p-tags.  Named channels and missing metadata fail closed.
+    # In normal channels a p-tag is only an addressing signal and must wake the
+    # agent without changing the conversation type.
 
     def _may_reclassify_as_dm(self, channel_id: str) -> bool:
         """True when the conversation's metadata does not rule out a DM.
 
         Known real community channels (real name or non-empty description in
         ``channels list``) must never turn into DMs just because a message
-        p-tags us.  A conversation with no metadata at all is trusted only
-        when the user did not explicitly configure it as a watched channel.
+        p-tags us.  Missing metadata fails closed rather than allowing a named
+        channel to latch as a DM before its metadata arrives.
         """
         meta = self._channel_meta.get(channel_id)
         if meta is None:
-            return channel_id not in self.channels
+            return False
         name = str(meta.get("name") or "").strip()
         description = str(meta.get("description") or "").strip()
         return name == "DM" and not description
+
+    def _p_tagged_to_self(self, event: dict) -> bool:
+        """True when the signed event addresses this identity by pubkey."""
+        if not self._self_pubkey:
+            return False
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return False
+        return any(
+            isinstance(tag, (list, tuple))
+            and len(tag) > 1
+            and tag[0] == "p"
+            and str(tag[1]).lower() == self._self_pubkey
+            for tag in tags
+        )
 
     def _is_direct_message_event(self, channel_id: str, event: dict) -> bool:
         """True when ``event`` is shaped like a direct message to us: a chat
@@ -1177,17 +2065,7 @@ class BuzzAdapter(BasePlatformAdapter):
         pubkey = str(event.get("pubkey") or "").lower()
         if not pubkey or pubkey == self._self_pubkey:
             return False
-        tags = event.get("tags")
-        if not isinstance(tags, list):
-            return False
-        p_tagged_to_self = any(
-            isinstance(tag, (list, tuple))
-            and len(tag) > 1
-            and tag[0] == "p"
-            and str(tag[1]).lower() == self._self_pubkey
-            for tag in tags
-        )
-        if not p_tagged_to_self:
+        if not self._p_tagged_to_self(event):
             return False
         content = event.get("content")
         return isinstance(content, str) and not self._is_mentioned(content)
@@ -1203,17 +2081,32 @@ class BuzzAdapter(BasePlatformAdapter):
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
 
     def _is_mentioned(self, content: str) -> bool:
-        """True when the message addresses this agent (npub, hex, or name)."""
+        """True when text explicitly addresses this agent (npub, hex, or @name)."""
         lowered = content.lower()
-        if self._self_pubkey and self._self_pubkey in lowered:
-            return True
-        if self._self_npub and self._self_npub in lowered:
-            return True
+        if self._self_pubkey and re.fullmatch(r"[0-9a-f]{64}", self._self_pubkey):
+            pattern = rf"(?<![0-9a-f]){re.escape(self._self_pubkey)}(?![0-9a-f])"
+            if re.search(pattern, lowered):
+                return True
+        if self._self_npub:
+            pattern = rf"(?<![a-z0-9]){re.escape(self._self_npub.lower())}(?![a-z0-9])"
+            if re.search(pattern, lowered):
+                return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = (
+                rf"(?<![\w@])@{re.escape(self._display_name.lower())}"
+                r"(?=$|[\s,;.!?:)\]}])"
+            )
             if re.search(pattern, lowered):
                 return True
         return False
+
+    def _is_addressed(self, event: dict) -> bool:
+        """True when a group event carries an explicit text or p-tag address."""
+        content = event.get("content")
+        return (
+            isinstance(content, str)
+            and (self._is_mentioned(content) or self._p_tagged_to_self(event))
+        )
 
     def _strip_mention(self, content: str) -> str:
         """Remove a leading @mention of this agent so the remaining text can be
@@ -1229,16 +2122,18 @@ class BuzzAdapter(BasePlatformAdapter):
         text = content.strip()
         candidates = []
         if self._display_name:
-            candidates.append(re.escape(self._display_name))
+            candidates.append(
+                rf"@{re.escape(self._display_name)}" + r"(?=$|[\s,;.!?:)\]}])"
+            )
         if self._self_npub:
-            candidates.append(re.escape(self._self_npub))
+            candidates.append(rf"@?{re.escape(self._self_npub)}(?![a-z0-9])")
         if self._self_pubkey:
-            candidates.append(re.escape(self._self_pubkey))
+            candidates.append(rf"@?{re.escape(self._self_pubkey)}(?![0-9a-f])")
         if not candidates:
             return text
-        # Optional leading '@', one of the identity forms, optional trailing
-        # ':' or ',' and surrounding whitespace.
-        pattern = rf"^@?(?:{'|'.join(candidates)})[\s:,]*"
+        # Display names require '@'; npub and hex identities are already
+        # unambiguous and may optionally include it.
+        pattern = rf"^(?:{'|'.join(candidates)})[\s:,]*"
         stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
         return stripped.strip()
 
@@ -1269,12 +2164,134 @@ class BuzzAdapter(BasePlatformAdapter):
         seen = state["seen"]
         while len(seen) > _SEEN_CAP:
             seen.popitem(last=False)
+        meta = state.get("event_meta")
+        if isinstance(meta, OrderedDict):
+            while len(meta) > _SEEN_CAP:
+                meta.popitem(last=False)
 
     def _mark_seen(self, channel_id: str, event_id: str) -> None:
         state = self._channel_state.get(channel_id)
         if state is not None:
             state["seen"][event_id] = None
             self._trim_seen(state)
+
+    # ── Thread anchoring ──────────────────────────────────────────────────
+    #
+    # NIP-10 marked ``e`` tags: a reply carries ["e", <root>, "", "root"] plus
+    # ["e", <parent>, "", "reply"]; a message that STARTS a thread carries a
+    # single ["e", <parent>, "", "reply"] and no root marker.
+    #
+    # The gateway hands adapters the triggering message's own id as the reply
+    # anchor.  Anchoring to that id is correct for a top-level message (it
+    # opens the thread the user expects), but inside an existing thread it
+    # nests a fresh sub-thread under every single answer.  Buzz renders that
+    # as an endless ladder of one-message threads.
+    #
+    # Fix: remember each inbound message's thread ROOT.  When the trigger was
+    # already inside a thread, reply against that root so our answer lands in
+    # the same thread the user is typing in.  When it was top-level, keep the
+    # existing behaviour and anchor to the message itself.
+
+    _THREAD_ROOT_CACHE = 512
+
+    @staticmethod
+    def _extract_thread_root(event: dict) -> Optional[str]:
+        """Return the NIP-10 thread root of ``event``, or None if top-level."""
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None
+        root = None
+        reply = None
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2:
+                continue
+            if str(tag[0]) != "e":
+                continue
+            marker = str(tag[3]).lower() if len(tag) > 3 else ""
+            if marker == "root":
+                root = str(tag[1])
+            elif marker == "reply":
+                reply = str(tag[1])
+            elif not marker and reply is None:
+                # Unmarked (deprecated positional) e-tag: treat as the parent.
+                reply = str(tag[1])
+        if root:
+            return root
+        # A lone "reply" e-tag means this message started a thread hanging off
+        # <reply>; that parent IS the thread root for anything that follows.
+        return reply
+
+    def _record_thread_root(self, event_id: str, event: dict) -> None:
+        """Cache the thread root for an inbound message id."""
+        if not event_id:
+            return
+        roots = getattr(self, "_thread_roots", None)
+        if roots is None:
+            roots = self._thread_roots = OrderedDict()
+        roots[event_id] = self._extract_thread_root(event)
+        roots.move_to_end(event_id)
+        while len(roots) > self._THREAD_ROOT_CACHE:
+            roots.popitem(last=False)
+
+    def _resolve_reply_anchor(self, anchor: Optional[str]) -> Optional[str]:
+        """Map a gateway reply anchor onto the right Buzz thread anchor.
+
+        Returns the thread root when the triggering message was already inside
+        a thread (so the reply joins it), otherwise the anchor unchanged (so a
+        reply to a top-level message opens one thread, as before).
+        """
+        if not anchor:
+            return anchor
+        roots = getattr(self, "_thread_roots", None) or {}
+        return roots.get(str(anchor)) or anchor
+    def _remember_event(self, state: dict, event: dict) -> None:
+        """Record author + content snippet for later NIP-10 parent lookup."""
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            return
+        pubkey = str(event.get("pubkey") or "").lower()
+        content = event.get("content")
+        snippet = content[:_EVENT_META_CONTENT_CAP] if isinstance(content, str) else ""
+        self._store_event_meta(state, event_id, pubkey, snippet)
+
+    def _remember_event_meta(
+        self,
+        channel_id: str,
+        event_id: str,
+        pubkey: str,
+        content: str,
+    ) -> None:
+        state = self._channel_state.get(channel_id)
+        if state is None or not event_id:
+            return
+        snippet = (content or "")[:_EVENT_META_CONTENT_CAP]
+        self._store_event_meta(state, event_id, (pubkey or "").lower(), snippet)
+
+    @staticmethod
+    def _store_event_meta(
+        state: dict,
+        event_id: str,
+        pubkey: str,
+        snippet: str,
+    ) -> None:
+        cache = state.setdefault("event_meta", OrderedDict())
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict(cache)
+            state["event_meta"] = cache
+        cache[event_id] = (pubkey, snippet)
+        cache.move_to_end(event_id)
+        while len(cache) > _SEEN_CAP:
+            cache.popitem(last=False)
+
+    @staticmethod
+    def _lookup_event_meta(state: dict, event_id: Optional[str]) -> Optional[Tuple[str, str]]:
+        if not event_id:
+            return None
+        cache = state.get("event_meta") or {}
+        entry = cache.get(event_id)
+        if not entry or not isinstance(entry, tuple) or len(entry) < 2:
+            return None
+        return str(entry[0] or ""), str(entry[1] or "")
 
     async def _dispatch_message(
         self,
@@ -1285,6 +2302,11 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        reply_to_text: Optional[str] = None,
+        reply_to_author_id: Optional[str] = None,
+        reply_to_is_own_message: bool = False,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1296,24 +2318,30 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
         )
 
+        # Reaction lifecycle: create state and queue 👀 as a tracked
+        # transition BEFORE handle_message (which spawns the background task
+        # that fires on_processing_start) so the states stay ordered.
+        # Skipped for commands / disabled gate / unauthorized senders / bad
+        # ids — see _reaction_eligible.
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
             message_id=message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id,
+            reply_to_is_own_message=reply_to_is_own_message,
         )
 
+        if self._reaction_eligible(event):
+            self._reaction_begin(chat_id, message_id)
+
         await self.handle_message(event)
-        
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1358,16 +2386,24 @@ def check_requirements() -> bool:
         extra = _profile_buzz_extra()
         relay = str(extra.get("relay_url") or "").strip()
         return bool(relay and _resolve_private_key(extra))
-    if not os.getenv("BUZZ_RELAY_URL", "").strip():
+    # Scope-aware read: the gate runs before per-profile scopes install, and
+    # BUZZ_RELAY_URL can be externally managed just like the key (#95216).
+    if not (_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip():
         return False
     return bool(_resolve_private_key())
 
 
 def validate_config(config) -> bool:
-    """Validate that the platform config has enough info to connect."""
+    """Validate that the platform config has enough information to connect."""
     extra = getattr(config, "extra", {}) or {}
-    relay = _scoped_platform_setting("BUZZ_RELAY_URL", extra, "relay_url")
-    relay = relay if relay is not None else extra.get("relay_url", "")
+    # Inside a secondary profile scope, extra is authoritative (#98738);
+    # unscoped, the env read gains the external-secret rung so a managed
+    # relay passes too (#95216).
+    if _profile_scoped():
+        relay = _scoped_platform_setting("BUZZ_RELAY_URL", extra, "relay_url")
+        relay = relay if relay is not None else extra.get("relay_url", "")
+    else:
+        relay = _get_scoped_secret("BUZZ_RELAY_URL", "") or extra.get("relay_url", "")
     return bool(relay and _resolve_private_key(extra))
 
 
@@ -1421,10 +2457,19 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         if isinstance(allowed, (list, tuple)):
             allowed = ",".join(str(a) for a in allowed)
         os.environ["BUZZ_ALLOWED_USERS"] = str(allowed)
+    reaction_only = extra.get("reaction_only_users")
+    if reaction_only is not None and not _skip_env_bridge and not os.getenv("BUZZ_REACTION_ONLY_USERS"):
+        if isinstance(reaction_only, (list, tuple)):
+            reaction_only = ",".join(str(v) for v in reaction_only)
+        os.environ["BUZZ_REACTION_ONLY_USERS"] = str(reaction_only)
     if "allow_all_users" in extra and not _skip_env_bridge and not os.getenv("BUZZ_ALLOW_ALL_USERS"):
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not _skip_env_bridge and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+    if "reply_in_thread" in extra and not os.getenv("BUZZ_REPLY_IN_THREAD"):
+        os.environ["BUZZ_REPLY_IN_THREAD"] = str(extra["reply_in_thread"]).lower()
+    if "reply_to_mode" in extra and not os.getenv("BUZZ_REPLY_TO_MODE"):
+        os.environ["BUZZ_REPLY_TO_MODE"] = str(extra["reply_to_mode"]).lower()
     return None
 
 
@@ -1491,6 +2536,10 @@ async def _standalone_send(
     relay = (_relay_raw or extra.get("relay_url", "")).strip()
     private_key = _resolve_private_key(extra)
     _cli_raw = _scoped_platform_setting("BUZZ_CLI_PATH", extra, "cli_path")
+    try:
+        auth_tag = _resolve_auth_tag(extra)
+    except ValueError as exc:
+        return {"error": f"Buzz standalone send: {exc}"}
     cli_path = _resolve_cli_path(
         str(_cli_raw or "").strip() or str(extra.get("cli_path", "") or "")
     )
@@ -1504,14 +2553,44 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    if thread_id:
+    # Same reply_to_mode / reply_in_thread gate as the live adapter, so
+    # out-of-process cron delivery (deliver=buzz) doesn't thread when the
+    # operator asked for flat channel replies.
+    _rtm = (os.getenv("BUZZ_REPLY_TO_MODE")
+            or getattr(pconfig, "reply_to_mode", "first") or "first")
+    _rtm = str(_rtm).strip().lower()
+    _rit = os.getenv("BUZZ_REPLY_IN_THREAD")
+    if _rit is None:
+        _rit = extra.get("reply_in_thread")
+    if _rit is not None and str(_rit).strip().lower() in ("false", "0", "no", "off"):
+        _rtm = "off"
+    if thread_id and _rtm != "off":
         args += ["--reply-to", str(thread_id)]
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
         code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
+            cli_path,
+            args,
+            relay_url=relay,
+            private_key=private_key,
+            auth_tag=auth_tag,
+            input_text=message,
         )
+        if code != 0:
+            escaped = _escape_unresolved_presentation_mention(message, err)
+            if escaped is not None:
+                logger.info(
+                    "Buzz: retrying standalone message after unresolved "
+                    "presentation-mention preflight"
+                )
+                code, out, err = await _exec_buzz(
+                    cli_path,
+                    args,
+                    relay_url=relay,
+                    private_key=private_key,
+                    input_text=escaped,
+                )
     except asyncio.CancelledError:
         raise
     except OSError as e:
