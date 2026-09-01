@@ -1484,7 +1484,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 chat_type=getattr(event.source, "chat_type", None),
                 chat_id=getattr(event.source, "chat_id", None),
             )
-            if decision is False:
+            if decision is not True:
                 return False
         return True
 

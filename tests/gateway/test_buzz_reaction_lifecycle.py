@@ -345,6 +345,25 @@ class TestTransitionCoordinator:
         await _drain_reactions(adapter)
         assert cli.reaction_ops() == []
 
+    @pytest.mark.parametrize("decision", [None, "allowed"])
+    def test_indeterminate_authorization_is_not_reaction_eligible(self, decision):
+        adapter = _make_adapter()
+        adapter.set_authorization_check(
+            lambda user_id, chat_type, chat_id: decision
+        )
+
+        assert adapter._reaction_eligible(_message_event(adapter)) is False
+
+    def test_authorization_error_is_not_reaction_eligible(self):
+        adapter = _make_adapter()
+
+        def fail_authorization(user_id, chat_type, chat_id):
+            raise RuntimeError("authorization unavailable")
+
+        adapter.set_authorization_check(fail_authorization)
+
+        assert adapter._reaction_eligible(_message_event(adapter)) is False
+
     @pytest.mark.asyncio
     async def test_no_auth_callback_still_gets_lifecycle(self):
         adapter = _make_adapter()  # no authorization callback installed
