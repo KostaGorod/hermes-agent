@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 from gateway.platforms.base import CachedMedia, MessageType
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
-from gateway.platforms.base import MessageType
 
 # Load plugins/platforms/buzz/adapter.py under a unique module name
 # (plugin_adapter_buzz) so it cannot collide with other plugin adapters
@@ -83,7 +82,12 @@ def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind
 def _make_adapter(extra=None):
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})})
+    # Keep legacy adapter tests focused on their own behavior. Reaction
+    # lifecycle coverage uses its dedicated test module and opts in there.
+    cfg = PlatformConfig(
+        enabled=True,
+        extra={"relay_url": "https://test.relay", "reactions": False, **(extra or {})},
+    )
     adapter = BuzzAdapter(cfg)
     adapter._self_pubkey = SELF_PUBKEY
     adapter._self_npub = SELF_NPUB
