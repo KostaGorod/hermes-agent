@@ -74,6 +74,30 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+def test_null_platform_toolsets_fall_back_to_platform_default():
+    """A YAML ``platform:`` value is absent, not an explicit empty list."""
+    config = {"platform_toolsets": {"cli": None}}
+
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    default_enabled = _get_platform_tools(
+        {}, "cli", include_default_mcp_servers=False
+    )
+
+    assert enabled == default_enabled
+
+
+def test_scalar_platform_toolsets_fall_back_to_platform_default():
+    """A non-list platform value is ignored by the resolver."""
+    config = {"platform_toolsets": {"cli": "bogus"}}
+
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    default_enabled = _get_platform_tools(
+        {}, "cli", include_default_mcp_servers=False
+    )
+
+    assert enabled == default_enabled
+
+
 
 
 
@@ -221,6 +245,7 @@ def test_first_install_nous_auto_configures_video_gen(monkeypatch):
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
         "KEENABLE_API_KEY",
+        "TAVILY_API_KEY",
         "PARALLEL_API_KEY",
         "BROWSERBASE_API_KEY",
         "BROWSERBASE_PROJECT_ID",
