@@ -1477,16 +1477,14 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         if not isinstance(getattr(event, "text", None), str) or event.is_command():
             return False
-        user_id = getattr(event.source, "user_id", None)
-        if user_id and self._authorization_check is not None:
-            decision = self._is_sender_authorized(
-                user_id,
-                chat_type=getattr(event.source, "chat_type", None),
-                chat_id=getattr(event.source, "chat_id", None),
-            )
-            if decision is not True:
-                return False
-        return True
+        if self._authorization_check is None:
+            return True
+        decision = self._is_sender_authorized(
+            getattr(event.source, "user_id", None),
+            chat_type=getattr(event.source, "chat_type", None),
+            chat_id=getattr(event.source, "chat_id", None),
+        )
+        return decision is True
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """👀 → 🧠 when background processing of the message begins."""

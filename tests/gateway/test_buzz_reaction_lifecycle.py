@@ -67,7 +67,7 @@ def _make_adapter(extra=None):
 
 
 def _message_event(adapter, text="hello", message_id="e1", chat_id=CHANNEL, chat_type="group",
-                   user_id=OTHER_PUBKEY):
+                   user_id: str | None = OTHER_PUBKEY):
     from gateway.platforms.base import MessageEvent, MessageType
 
     source = adapter.build_source(
@@ -363,6 +363,16 @@ class TestTransitionCoordinator:
         adapter.set_authorization_check(fail_authorization)
 
         assert adapter._reaction_eligible(_message_event(adapter)) is False
+
+    def test_missing_sender_is_not_reaction_eligible_with_authorization(self):
+        adapter = _make_adapter()
+        adapter.set_authorization_check(
+            lambda user_id, chat_type, chat_id: True
+        )
+
+        assert adapter._reaction_eligible(
+            _message_event(adapter, user_id=None)
+        ) is False
 
     @pytest.mark.asyncio
     async def test_no_auth_callback_still_gets_lifecycle(self):
