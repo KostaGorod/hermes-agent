@@ -475,6 +475,146 @@ class TestMultiplexProfileScope:
         finally:
             reset_hermes_home_override(token)
 
+    def test_gate_view_matches_loader_effective_config(self, monkeypatch, tmp_path):
+        """Round-3 review: the gate's config view must equal what the loader
+        composes — value-level, not just presence-level.
+
+        Runtime relay precedence (gateway/config.py:1599-1637 nested merge +
+        the plugin bridge dispatch at 1816-1846 feeding
+        adapter._apply_yaml_config): env wins; else the ONE bridge block
+        (top-level ``buzz:`` if present, else ``gateway.platforms.buzz``,
+        else ``platforms.buzz``) seeds its truthy bridged keys into env;
+        else merged nested extra (each block's ``extra:`` sub-key only;
+        ``gateway.buzz`` overlays last, and bare keys in any nested block
+        never become extra). So an empty-string override in a later block
+        does NOT clear the relay the bridge seeded from an earlier block.
+        """
+        import os as _os
+        import yaml
+        from gateway.config import Platform, load_gateway_config
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"nsec": "nsec1compose"}), encoding="utf-8")
+        missing = tmp_path / "missing.json"  # never created; must be ignored
+
+        for var in ("BUZZ_RELAY_URL", "BUZZ_CREDENTIALS_FILE", "BUZZ_PRIVATE_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(
+            _buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here"
+        )
+
+        def evaluate(cfg):
+            """Load under this home; return (gate, validate, helper, runtime)."""
+            (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            _os.environ.pop("BUZZ_RELAY_URL", None)
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                loaded = load_gateway_config()
+                pconf = loaded.platforms.get(Platform("buzz"))
+                helper = _buzz_mod._read_profile_buzz_extra()
+                gate = check_requirements()
+                validate = _buzz_mod.validate_config(pconf) if pconf else False
+                runtime_relay = _os.environ.get("BUZZ_RELAY_URL", "") or (
+                    pconf.extra.get("relay_url", "") if pconf else ""
+                )
+                return gate, validate, helper, runtime_relay
+            finally:
+                reset_hermes_home_override(token)
+                _os.environ.pop("BUZZ_RELAY_URL", None)
+
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", None)
+
+        gw_plat = {"extra": {"relay_url": "https://gp", "credentials_file": str(creds)}}
+
+        # Empty-string relay override in a later block must not clear the
+        # relay bridged from gateway.platforms.buzz (env beats extra).
+        for cfg in (
+            {"gateway": {"platforms": {"buzz": gw_plat}},
+             "platforms": {"buzz": {"extra": {"relay_url": ""}}}},
+            {"gateway": {"platforms": {"buzz": gw_plat},
+                         "buzz": {"extra": {"relay_url": ""}}}},
+        ):
+            gate, validate, helper, runtime = evaluate(cfg)
+            assert runtime == "https://gp", cfg
+            assert helper.get("relay_url") == runtime, cfg
+            assert gate is True and validate is True, cfg
+
+        # gateway.buzz BARE keys never become extra: a bogus direct
+        # credentials_file must not mask the valid nested one.
+        cfg = {"gateway": {"platforms": {"buzz": gw_plat},
+                           "buzz": {"credentials_file": str(missing)}}}
+        gate, validate, helper, runtime = evaluate(cfg)
+        assert helper.get("credentials_file") == str(creds)
+        assert gate is True and validate is True
+
+        # All four locations with conflicting relays: the bridge block
+        # (top-level) supplies the runtime value; the helper must agree.
+        cfg = {
+            "gateway": {
+                "platforms": {"buzz": {"extra": {
+                    "relay_url": "https://gwplat", "credentials_file": str(creds)}}},
+                "buzz": {"extra": {"relay_url": "https://gwdirect"}},
+            },
+            "platforms": {"buzz": {"extra": {"relay_url": "https://plats"}}},
+            "buzz": {"extra": {"relay_url": "https://top"}},
+        }
+        gate, validate, helper, runtime = evaluate(cfg)
+        assert runtime == "https://top"
+        assert helper.get("relay_url") == runtime
+        assert gate is True and validate is True
+
+        # Three nested locations, no top-level block: the bridge falls back
+        # to gateway.platforms.buzz, overriding gateway.buzz's extra overlay.
+        cfg = {k: v for k, v in cfg.items() if k != "buzz"}
+        gate, validate, helper, runtime = evaluate(cfg)
+        assert runtime == "https://gwplat"
+        assert helper.get("relay_url") == runtime
+        assert gate is True and validate is True
+
+    def test_scoped_gate_ignores_top_level_buzz_config(
+        self, multiplex_scope, default_profile_env, monkeypatch, tmp_path
+    ):
+        """Round-3 review: under a secondary profile scope the YAML→env
+        bridge is disabled and top-level ``buzz:`` never reaches
+        PlatformConfig.extra — a profile configured ONLY via top-level
+        ``buzz:`` is unconfigured at runtime, so the scoped gate must
+        fail closed instead of green-lighting it."""
+        import yaml
+        from gateway.config import Platform, load_gateway_config
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"nsec": "nsec1toponly"}), encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"buzz": {"enabled": True, "extra": {
+                    "relay_url": "https://top.relay",
+                    "credentials_file": str(creds),
+                }}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        multiplex_scope()
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            loaded = load_gateway_config()
+            pconf = loaded.platforms.get(Platform("buzz"))
+            extra = dict(pconf.extra) if pconf else {}
+            assert "relay_url" not in extra, "top-level buzz must not reach scoped extra"
+            assert check_requirements() is False
+            if pconf is not None:
+                assert _buzz_mod.validate_config(pconf) is False
+        finally:
+            reset_hermes_home_override(token)
+
 
     def test_env_enablement_scoped_returns_none(self, multiplex_scope, default_profile_env):
         """Scoped env enablement must not fabricate Buzz for a profile from

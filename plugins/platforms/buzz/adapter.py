@@ -3520,13 +3520,30 @@ def _read_profile_buzz_extra() -> dict:
     only in config.yaml is otherwise invisible to it. Best-effort — any
     failure yields an empty mapping and the caller fails closed.
 
-    Mirrors how ``load_gateway_config`` composes the platform's effective
-    block (gateway/config.py: ``gateway.platforms.buzz`` merges first,
-    ``platforms.buzz`` overlays it, the ``gateway.buzz`` subsection overlays
-    last, and a top-level ``buzz:`` block only fills gaps — it never becomes
-    extra; its bridged keys seed env where unset). Returning the first
-    matching block instead of the merged one made the gate disagree with the
-    loader on composed configs (review of f0bf5f79).
+    Mirrors what the unscoped loader produces at runtime, per key kind:
+
+    * Nested blocks (``gateway.platforms.buzz``, ``platforms.buzz``,
+      ``gateway.buzz``) merge through their ``extra:`` sub-keys in loader
+      order — gateway.platforms first, platforms overlays it, gateway.buzz
+      overlays last. Bare (non-``extra``) keys in nested blocks never
+      become runtime extra.
+    * Bridged keys (``_BRIDGED_EXTRA_KEYS``) additionally resolve through
+      the ONE block the loader dispatches ``_apply_yaml_config`` on —
+      top-level ``buzz:`` when present, else ``gateway.platforms.buzz``,
+      else ``platforms.buzz`` — but only truthy values: the bridge writes
+      env first-writer-wins and skips empties, and env beats extra at the
+      adapter. So an empty-string override never clears a bridged value,
+      and the top-level block's truthy bridged keys win outright.
+    * Non-bridged keys (``credentials_file`` is never bridged) keep
+      gap-fill semantics from the top-level block: the bridge never
+      exports them, so runtime sees them only through this helper's
+      last-resort rung in ``_credentials_candidates``.
+    * Under a secondary-profile scope the bridge is disabled and the
+      top-level block never reaches ``PlatformConfig.extra`` (#98738):
+      nested ``extra:`` sub-keys only.
+
+    Earlier shapes (first-match at f0bf5f79, plain nested-merge at
+    dc5860ca) made the gate disagree with the loader on composed configs.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -3545,19 +3562,42 @@ def _read_profile_buzz_extra() -> dict:
         return value if isinstance(value, dict) else {}
 
     def _extra_of(block) -> dict:
+        # Extra-or-bare, mirroring ``_apply_yaml_config``'s view of the
+        # block it is dispatched on.
         extra = block.get("extra", block)
         return extra if isinstance(extra, dict) else {}
 
+    def _extra_only(block) -> dict:
+        # Nested blocks contribute ONLY their ``extra:`` sub-key to the
+        # runtime merge (gateway/config.py ``_merge_platform_map`` merges
+        # ``plat_block.get("extra", {})``); bare keys are dropped.
+        extra = block.get("extra")
+        return extra if isinstance(extra, dict) else {}
+
     gateway_cfg = _section(cfg, "gateway")
+    gw_platforms_block = _section(_section(gateway_cfg, "platforms"), "buzz")
+    platforms_block = _section(_section(cfg, "platforms"), "buzz")
+
     merged: dict = {}
-    for block in (
-        _section(_section(gateway_cfg, "platforms"), "buzz"),
-        _section(_section(cfg, "platforms"), "buzz"),
-        _section(gateway_cfg, "buzz"),
-    ):
-        merged.update(_extra_of(block))
-    # Top-level buzz: never part of extra — fill only keys nested didn't set.
-    for key, value in _extra_of(_section(cfg, "buzz")).items():
+    for block in (gw_platforms_block, platforms_block, _section(gateway_cfg, "buzz")):
+        merged.update(_extra_only(block))
+
+    top_block = _section(cfg, "buzz")
+    if _profile_scoped():
+        # Secondary profile scope: no env bridge, and top-level ``buzz:``
+        # never lands in PlatformConfig.extra — it is inert here.
+        return merged
+
+    # Unscoped: bridged keys resolve through the ONE bridge block, truthy
+    # values only, overriding the nested merge (env beats extra).
+    bridge_block = top_block or gw_platforms_block or platforms_block
+    bridge_extra = _extra_of(bridge_block)
+    for key in _BRIDGED_EXTRA_KEYS:
+        value = bridge_extra.get(key)
+        if value:
+            merged[key] = value
+    # Non-bridged keys from the top-level block only fill gaps.
+    for key, value in _extra_of(top_block).items():
         merged.setdefault(key, value)
     return merged
 
@@ -3604,6 +3644,25 @@ def validate_config(config) -> bool:
 def is_connected(config) -> bool:
     """Check whether Buzz is configured (env or config.yaml)."""
     return validate_config(config)
+
+
+# Keys ``_apply_yaml_config`` bridges into ``BUZZ_*`` env vars. The gate's
+# config view must resolve these through the bridge block order, matching
+# runtime where env (the bridge's output) beats extra.
+_BRIDGED_EXTRA_KEYS = (
+    "relay_url",
+    "cli_path",
+    "home_channel",
+    "transport",
+    "poll_interval",
+    "channels",
+    "allowed_users",
+    "reaction_only_users",
+    "allow_all_users",
+    "require_mention",
+    "reply_in_thread",
+    "reply_to_mode",
+)
 
 
 def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
