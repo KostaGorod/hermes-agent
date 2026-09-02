@@ -475,6 +475,98 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_allows_explicit_same_card_review_rework(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer-requested changes must return the existing PR to its implementer."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fix reviewed PR", assignee="builder")
+        implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+        assert implementation is not None
+        kb.add_comment(conn, task_id, author="builder", body=pr_comment)
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="PR ready",
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+        assert review is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Correct the PR body.",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+
+        rework = kb.get_task(conn, task_id)
+        assert rework is not None
+        assert rework.status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+        now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'builder', 'crashed', "
+                "'crashed', ?, ?)",
+                (task_id, now + 1, now + 1),
+            )
+        assert kb.check_respawn_guard(conn, task_id) is None
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert task_id in [spawned[0] for spawned in result.spawned]
+    assert task_id not in dict(result.respawn_guarded)
+
+
+def test_active_pr_guarded_ready_task_is_not_reported_spawnable(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Health telemetry must not call an intentionally guarded queue stuck."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="already published", assignee="builder")
+        kb.add_comment(
+            conn,
+            task_id,
+            author="builder",
+            body="Opened https://github.com/example/repo/pull/123 for review.",
+        )
+
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.has_spawnable_ready(conn) is False
+
+
+def test_spawnability_probe_stays_conservative_if_guard_fails(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken health probe must not hide genuinely stuck work."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="guard unavailable", assignee="builder")
+        monkeypatch.setattr(
+            kb,
+            "check_respawn_guard",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("guard probe failed")
+            ),
+        )
+
+        assert kb.has_spawnable_ready(conn) is True
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

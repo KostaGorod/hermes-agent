@@ -9447,8 +9447,11 @@ def check_respawn_guard(
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds). A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        The guard is bypassed while a kernel-owned ``changes_requested``
+        transition remains the latest review transition, because that state
+        explicitly requires the implementer to update the existing PR.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9511,6 +9514,25 @@ def check_respawn_guard(
     if lane == "review":
         return None
 
+    # A reviewer returning the same card to its implementer is an explicit
+    # rework instruction. The PR URL intentionally remains on the card, so the
+    # ordinary ready-lane active_pr guard would otherwise deadlock the
+    # supported review -> changes_requested -> ready cycle for 24 hours.
+    # Review events are the durable control-plane source of truth. A failed
+    # rework run does not erase the outstanding request; the next
+    # review_requested event does.
+    latest_review_transition = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN ('review_requested', 'changes_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if (
+        latest_review_transition is not None
+        and latest_review_transition["kind"] == "changes_requested"
+    ):
+        return None
+
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
     #    dragging done→ready, a dependency re-promotion, an unblock, a
@@ -9548,23 +9570,18 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+def _has_spawnable_in_lane(
+    conn: sqlite3.Connection, status: str, lane: str,
+) -> bool:
+    """Return whether one task passes profile and respawn admission.
 
-    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
-
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    Guard-deferred tasks are intentionally idle, not evidence that the
+    dispatcher failed. If guard inspection itself fails, keep the historical
+    conservative health warning rather than hiding a possibly stuck task.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
+        "SELECT id, assignee FROM tasks "
+        f"WHERE status = '{status}' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
@@ -9572,37 +9589,27 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if not profile_exists(row["assignee"]):
+            continue
+        try:
+            deferred = check_respawn_guard(conn, row["id"], lane=lane)
+        except Exception:
+            return True
+        if deferred is None:
             return True
     return False
+
+
+def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+    """Return whether one ready task is actually eligible to spawn."""
+    return _has_spawnable_in_lane(conn, "ready", "ready")
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    """Return whether one review task is actually eligible to spawn."""
+    return _has_spawnable_in_lane(conn, "review", "review")
 
 
 def review_dispatch_enabled() -> bool:
