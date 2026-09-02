@@ -130,16 +130,31 @@ class _ScriptedWebSocket(_FakeWebSocket):
         self.exited = True
 
     def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        return await self._anext_behavior()
+        # Production shape (websockets 15.x): __aiter__() returns a distinct
+        # async iterator that does NOT expose ping()/pong() — the connection
+        # object does. Tests must not conflate the two, or a probe that pings
+        # the iterator instead of the connection passes while production
+        # never pings at all.
+        return _ScriptedFrameIterator(self._anext_behavior)
 
     async def ping(self):
         self.ping_count += 1
         if self._ping_behavior is None:
             return None
         return await self._ping_behavior()
+
+
+class _ScriptedFrameIterator:
+    """Async iterator over scripted frames — the production iterator shape."""
+
+    def __init__(self, anext_behavior):
+        self._anext_behavior = anext_behavior
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._anext_behavior()
 
 
 async def _resolved_pong():

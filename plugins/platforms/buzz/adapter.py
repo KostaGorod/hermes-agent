@@ -2277,29 +2277,28 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("Buzz: WebSocket discovery sweep failed", exc_info=True)
 
-    async def _probe_liveness(self, frame_iter) -> None:
+    async def _probe_liveness(self, websocket) -> None:
         """Demand proof of transport life via a ping/pong round-trip.
 
-        Real websockets connections are their own iterator and expose
-        ``ping()`` — awaiting it sends the ping and returns a pong waiter,
-        which is then awaited here. In the #98097 shape (socket parked in
+        Pings the *connection object* — in websockets 15.x ``ping()`` lives on
+        ``ClientConnection``; ``__aiter__()`` yields a distinct async generator
+        with no ping surface, so probing the iterator would silently send
+        nothing. Awaiting ``ping()`` sends the ping and returns a pong waiter,
+        which is awaited here. In the #98097 shape (socket parked in
         CLOSE_WAIT), the send succeeds into the kernel buffer but the waiter
         never completes, so the caller's timeout fires. Test doubles without
         a ping surface return immediately: their liveness is their ``recv()``
         behavior. Transport errors (ConnectionClosed) propagate to the
         reconnect path.
         """
-        for target in (frame_iter, frame_iter.__aiter__() if hasattr(frame_iter, "__aiter__") else None):
-            if target is None:
-                continue
-            ping_fn = getattr(target, "ping", None)
-            if callable(ping_fn):
-                pong_waiter = await cast("Awaitable[Any]", ping_fn())
-                if pong_waiter is not None:
-                    await pong_waiter
-                return
+        ping_fn = getattr(websocket, "ping", None)
+        if not callable(ping_fn):
+            return
+        pong_waiter = await cast("Awaitable[Any]", ping_fn())
+        if pong_waiter is not None:
+            await pong_waiter
 
-    async def _read_frame_or_probe(self, frame_iter) -> str:
+    async def _read_frame_or_probe(self, frame_iter, websocket) -> str:
         """Await the next frame, probing transport liveness while quiet.
 
         Race the raw frame read against a periodic ping round-trip. When a
@@ -2323,7 +2322,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 # Quiet for one interval: demand proof of life.
                 try:
                     await asyncio.wait_for(
-                        self._probe_liveness(frame_iter),
+                        self._probe_liveness(websocket),
                         timeout=_WS_LIVENESS_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
@@ -2387,7 +2386,7 @@ class BuzzAdapter(BasePlatformAdapter):
                                 # unanswered probe — or any transport error
                                 # — raises into the reconnect path.
                                 raw = await self._read_frame_or_probe(
-                                    frame_iter
+                                    frame_iter, websocket
                                 )
                                 try:
                                     message = json.loads(raw)
@@ -3530,11 +3529,23 @@ def _read_profile_buzz_extra() -> dict:
         return {}
     if not isinstance(cfg, dict):
         return {}
-    buzz = ((cfg.get("gateway") or {}).get("platforms") or {}).get("buzz")
-    if not isinstance(buzz, dict):
-        return {}
-    extra = buzz.get("extra", buzz)
-    return extra if isinstance(extra, dict) else {}
+    # Match every location load_gateway_config accepts for a platform block:
+    # gateway.platforms.<name>, platforms.<name>, and top-level <name>: —
+    # with the same precedence (nested merged first, top-level last).
+    gateway_cfg = cfg.get("gateway")
+    candidates = (
+        (gateway_cfg.get("platforms") if isinstance(gateway_cfg, dict) else None),
+        cfg.get("platforms"),
+        cfg,
+    )
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        buzz = source.get("buzz")
+        if isinstance(buzz, dict):
+            extra = buzz.get("extra", buzz)
+            return extra if isinstance(extra, dict) else {}
+    return {}
 
 
 def check_requirements() -> bool:

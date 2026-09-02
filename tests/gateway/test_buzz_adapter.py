@@ -342,33 +342,27 @@ class TestMultiplexProfileScope:
         """Default-profile boot (#98748 deploy): the gate runs before the
         YAML→env bridge pins anything (and ``credentials_file`` is never
         bridged), so a ``buzz.extra.credentials_file`` declared only in
-        config.yaml must still satisfy ``check_requirements``."""
+        config.yaml must still satisfy ``check_requirements`` — in every
+        location the gateway loader accepts (``gateway.platforms.buzz``,
+        ``platforms.buzz``, and top-level ``buzz:``)."""
         import yaml
         from hermes_constants import (
             reset_hermes_home_override,
             set_hermes_home_override,
         )
 
-        creds = tmp_path / "hermes.json"
-        creds.write_text(json.dumps({"nsec": "nsec1fromprofilecfg"}), encoding="utf-8")
-        (tmp_path / "config.yaml").write_text(
-            yaml.safe_dump(
-                {
-                    "gateway": {
-                        "platforms": {
-                            "buzz": {
-                                "enabled": True,
-                                "extra": {
-                                    "relay_url": "https://default.relay",
-                                    "credentials_file": str(creds),
-                                },
-                            }
-                        }
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
+        def write_config(location):
+            creds = tmp_path / "hermes.json"
+            creds.write_text(json.dumps({"nsec": "nsec1fromprofilecfg"}), encoding="utf-8")
+            extra = {"relay_url": "https://default.relay", "credentials_file": str(creds)}
+            if location == "gateway.platforms.buzz":
+                cfg = {"gateway": {"platforms": {"buzz": {"enabled": True, "extra": extra}}}}
+            elif location == "platforms.buzz":
+                cfg = {"platforms": {"buzz": {"enabled": True, "extra": extra}}}
+            else:  # top-level buzz:
+                cfg = {"buzz": {"enabled": True, "extra": extra}}
+            (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
         # No BUZZ_CREDENTIALS_FILE / BUZZ_PRIVATE_KEY in env: the unscoped
         # gate must fall through to the profile's config.yaml for the key.
         # Pin the glob dir so a developer's real ~/.config/buzz cannot
@@ -379,11 +373,13 @@ class TestMultiplexProfileScope:
             _buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here"
         )
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://default.relay")
-        token = set_hermes_home_override(str(tmp_path))
-        try:
-            assert check_requirements() is True
-        finally:
-            reset_hermes_home_override(token)
+        for location in ("gateway.platforms.buzz", "platforms.buzz", "top-level buzz"):
+            write_config(location)
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                assert check_requirements() is True, f"gate failed for {location}"
+            finally:
+                reset_hermes_home_override(token)
 
         # And a config.yaml with no credentials anywhere still fails closed.
         (tmp_path / "config.yaml").write_text(
