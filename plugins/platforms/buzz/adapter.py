@@ -3511,14 +3511,22 @@ def _profile_buzz_extra() -> dict:
 
 
 def _read_profile_buzz_extra() -> dict:
-    """Read ``buzz.extra`` from the active hermes home's config.yaml.
+    """Read the effective ``buzz.extra`` from the active hermes home's config.yaml.
 
     Shared by the scoped gate (secondary multiplex profiles, where the
     hermes-home override points at that profile's home) and the unscoped
     default-profile gate: ``check_requirements()`` receives no
-    ``PlatformConfig``, so a ``credentials_file`` declared only in config.yaml
-    is otherwise invisible to it. Best-effort — any failure yields an empty
-    mapping and the caller fails closed.
+    ``PlatformConfig``, so a ``credentials_file`` or ``relay_url`` declared
+    only in config.yaml is otherwise invisible to it. Best-effort — any
+    failure yields an empty mapping and the caller fails closed.
+
+    Mirrors how ``load_gateway_config`` composes the platform's effective
+    block (gateway/config.py: ``gateway.platforms.buzz`` merges first,
+    ``platforms.buzz`` overlays it, the ``gateway.buzz`` subsection overlays
+    last, and a top-level ``buzz:`` block only fills gaps — it never becomes
+    extra; its bridged keys seed env where unset). Returning the first
+    matching block instead of the merged one made the gate disagree with the
+    loader on composed configs (review of f0bf5f79).
     """
     try:
         from hermes_constants import get_hermes_home
@@ -3529,23 +3537,29 @@ def _read_profile_buzz_extra() -> dict:
         return {}
     if not isinstance(cfg, dict):
         return {}
-    # Match every location load_gateway_config accepts for a platform block:
-    # gateway.platforms.<name>, platforms.<name>, and top-level <name>: —
-    # with the same precedence (nested merged first, top-level last).
-    gateway_cfg = cfg.get("gateway")
-    candidates = (
-        (gateway_cfg.get("platforms") if isinstance(gateway_cfg, dict) else None),
-        cfg.get("platforms"),
-        cfg,
-    )
-    for source in candidates:
+
+    def _section(source, key) -> dict:
         if not isinstance(source, dict):
-            continue
-        buzz = source.get("buzz")
-        if isinstance(buzz, dict):
-            extra = buzz.get("extra", buzz)
-            return extra if isinstance(extra, dict) else {}
-    return {}
+            return {}
+        value = source.get(key)
+        return value if isinstance(value, dict) else {}
+
+    def _extra_of(block) -> dict:
+        extra = block.get("extra", block)
+        return extra if isinstance(extra, dict) else {}
+
+    gateway_cfg = _section(cfg, "gateway")
+    merged: dict = {}
+    for block in (
+        _section(_section(gateway_cfg, "platforms"), "buzz"),
+        _section(_section(cfg, "platforms"), "buzz"),
+        _section(gateway_cfg, "buzz"),
+    ):
+        merged.update(_extra_of(block))
+    # Top-level buzz: never part of extra — fill only keys nested didn't set.
+    for key, value in _extra_of(_section(cfg, "buzz")).items():
+        merged.setdefault(key, value)
+    return merged
 
 
 def check_requirements() -> bool:
@@ -3562,7 +3576,14 @@ def check_requirements() -> bool:
     # Scope-aware read: the gate runs before per-profile scopes install, and
     # BUZZ_RELAY_URL can be externally managed just like the key (#95216).
     if not (_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip():
-        return False
+        # The gate runs before load_gateway_config's YAML→env bridge, but the
+        # bridge seeds BUZZ_RELAY_URL wherever env is unset — so a relay
+        # declared only in config.yaml is effective at runtime and must not
+        # fail the gate here. Consult the same merged config view the key
+        # fallback uses; fail closed when neither place has a relay.
+        relay_cfg = str(_read_profile_buzz_extra().get("relay_url", "")).strip()
+        if not relay_cfg:
+            return False
     return bool(_resolve_private_key())
 
 

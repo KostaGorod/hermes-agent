@@ -381,12 +381,93 @@ class TestMultiplexProfileScope:
             finally:
                 reset_hermes_home_override(token)
 
+        # Composed shapes the loader supports (gateway/config.py:1599-1637):
+        # nested locations deep-merge in loader order — gateway.platforms.buzz
+        # first, platforms.buzz overlays it, gateway.buzz overlays last — and
+        # the top-level block only fills gaps (it never lands in extra; its
+        # bridged keys seed env only where unset). The gate must accept what
+        # the loader composes.
+        creds = tmp_path / "hermes.json"
+        creds.write_text(json.dumps({"nsec": "nsec1splitcfg"}), encoding="utf-8")
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here")
+
+        def write_yaml(cfg):
+            (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        def gate_under_home():
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                return check_requirements()
+            finally:
+                reset_hermes_home_override(token)
+
+        # (a) Split across nested locations: relay under gateway.platforms.buzz,
+        #     credentials_file under platforms.buzz → merged extra has both.
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"enabled": True, "extra": {"relay_url": "https://a.relay"}}}},
+                "platforms": {"buzz": {"extra": {"credentials_file": str(creds)}}},
+            }
+        )
+        assert gate_under_home() is True, (
+            "split nested config (relay + credentials_file) must pass the gate"
+        )
+
+        # (b) Precedence: platforms.buzz overrides gateway.platforms.buzz.
+        marker_creds = tmp_path / "marker-hermes.json"
+        marker_creds.write_text(json.dumps({"nsec": "nsec1marker"}), encoding="utf-8")
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"extra": {"credentials_file": str(marker_creds)}}}},
+                "platforms": {"buzz": {"extra": {"credentials_file": str(creds)}}},
+            }
+        )
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is True
+            assert _buzz_mod._credentials_candidates() == [
+                _buzz_mod.Path(str(creds)).expanduser()
+            ]
+        finally:
+            reset_hermes_home_override(token)
+
+        # (c) Top-level buzz: fills gaps but does not override nested extra.
+        top_creds = tmp_path / "top-hermes.json"
+        top_creds.write_text(json.dumps({"nsec": "nsec1top"}), encoding="utf-8")
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"extra": {"relay_url": "https://nested.relay"}}}},
+                "buzz": {"extra": {"credentials_file": str(top_creds)}},
+            }
+        )
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is True
+            assert _buzz_mod._credentials_candidates() == [
+                _buzz_mod.Path(str(top_creds)).expanduser()
+            ]
+        finally:
+            reset_hermes_home_override(token)
+
+        # (d) Config-only relay: the gate runs before load_gateway_config's
+        #     YAML→env bridge, but the bridge seeds BUZZ_RELAY_URL where env
+        #     is unset — so the gate must not fail a config-only relay.
+        creds2 = tmp_path / "hermes2.json"
+        creds2.write_text(json.dumps({"nsec": "nsec1relayonly"}), encoding="utf-8")
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"extra": {
+                    "relay_url": "https://cfgonly.relay",
+                    "credentials_file": str(creds2),
+                }}}},
+            }
+        )
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        assert gate_under_home() is True
+
         # And a config.yaml with no credentials anywhere still fails closed.
-        (tmp_path / "config.yaml").write_text(
-            yaml.safe_dump(
-                {"gateway": {"platforms": {"buzz": {"enabled": True, "extra": {"relay_url": "https://r"}}}}}
-            ),
-            encoding="utf-8",
+        write_yaml(
+            {"gateway": {"platforms": {"buzz": {"enabled": True, "extra": {"relay_url": "https://r"}}}}}
         )
         token = set_hermes_home_override(str(tmp_path))
         try:
