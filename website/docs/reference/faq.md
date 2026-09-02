@@ -343,7 +343,7 @@ providers:
 
 (Older configs use the legacy `custom_providers:` list — still supported and auto-migrated to `providers:`.)
 
-See [Context Length Detection](../integrations/providers.md#context-length-detection) for how auto-detection works and all override options.
+See [Context Length Detection](../integrations/providers.md#context-length-detection) for how auto-detection works and all override options. To register your own endpoint as a named provider — with the full entry schema, `/model custom:name:model` routing, vendor-prefix model routing, and the `OPENAI_BASE_URL` trap — see the [Custom Providers guide](/user-guide/custom-providers).
 
 ---
 

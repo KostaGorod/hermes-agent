@@ -31,6 +31,7 @@ const sidebars: SidebarsConfig = {
         'user-guide/configuration',
         'user-guide/managed-scope',
         'user-guide/configuring-models',
+        'user-guide/custom-providers',
         {
           type: 'category',
           label: 'Secrets',

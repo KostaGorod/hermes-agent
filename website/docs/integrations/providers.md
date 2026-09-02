@@ -1284,7 +1284,7 @@ providers:
 
 ### Named Custom Providers
 
-If you work with multiple custom endpoints (e.g., a local dev server and a remote GPU server), you can define them as named custom providers under the `providers:` dict in `config.yaml`, keyed by provider name:
+If you work with multiple custom endpoints (e.g., a local dev server and a remote GPU server), you can define them as named custom providers under the `providers:` dict in `config.yaml`, keyed by provider name. For the full standalone setup guide — schema, `/model` routing forms, legacy migration, and common traps — see [Custom Providers](/user-guide/custom-providers); this section stays as the reference for the fields:
 
 ```yaml
 providers:

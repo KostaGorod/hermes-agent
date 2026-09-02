@@ -339,6 +339,8 @@ Both paths feed the same loader (`hermes_cli/model_switch.py`). Entries declared
 
 Then `/model fav` or `/model grok` in chat. User aliases shadow built-in short names (`sonnet`, `kimi`, `opus`, etc.). See [Custom model aliases](/reference/slash-commands#custom-model-aliases) for the full reference.
 
+To point any of this at your own OpenAI- or Anthropic-compatible endpoint (vLLM, Ollama, a proxy), see [Custom Providers](/user-guide/custom-providers) for the full setup guide — named `providers:` entries, `/model custom:name:model` routing, and the `OPENAI_BASE_URL` trap.
+
 ### `hermes model` subcommand
 
 ```bash
