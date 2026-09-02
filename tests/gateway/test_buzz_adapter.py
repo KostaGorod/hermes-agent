@@ -575,6 +575,143 @@ class TestMultiplexProfileScope:
         assert helper.get("relay_url") == runtime
         assert gate is True and validate is True
 
+        # A present-but-empty top-level bridge block is selected by the
+        # loader, so it must NOT fall through to gateway.platforms.buzz for
+        # bridging. With a later nested empty relay overlay blanking the
+        # merged extra, runtime has no relay — the gate must agree and fail.
+        cfg = {
+            "gateway": {
+                "platforms": {"buzz": {"extra": {
+                    "relay_url": "https://gwplat", "credentials_file": str(creds)}}},
+            },
+            "platforms": {"buzz": {"extra": {"relay_url": ""}}},
+            "buzz": {},
+        }
+        gate, validate, helper, runtime = evaluate(cfg)
+        assert runtime == ""
+        assert helper.get("relay_url", "") == runtime
+        assert gate is False and validate is False
+
+    def test_gate_view_includes_gateway_json_base_and_managed_overlay(
+        self, monkeypatch, tmp_path
+    ):
+        """Round-4 review: the gate's config view must include the two base
+        layers ``load_gateway_config()`` composes from — the legacy
+        ``gateway.json`` platforms map (yaml overlays on top) and the
+        administrator managed-scope overlay (gateway/config.py:1396-1424).
+
+        A relay declared only in ``gateway.json`` (with credentials split
+        into config.yaml) or only in a managed scope must satisfy the gate
+        exactly as it satisfies runtime validation.
+        """
+        import os as _os
+        import yaml
+        from gateway.config import Platform, load_gateway_config
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"nsec": "nsec1legacy"}), encoding="utf-8")
+
+        for var in ("BUZZ_RELAY_URL", "BUZZ_CREDENTIALS_FILE", "BUZZ_PRIVATE_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(
+            _buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here"
+        )
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", None)
+
+        def evaluate():
+            _os.environ.pop("BUZZ_RELAY_URL", None)
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                loaded = load_gateway_config()
+                pconf = loaded.platforms.get(Platform("buzz"))
+                helper = _buzz_mod._read_profile_buzz_extra()
+                gate = check_requirements()
+                validate = _buzz_mod.validate_config(pconf) if pconf else False
+                runtime_relay = _os.environ.get("BUZZ_RELAY_URL", "") or (
+                    pconf.extra.get("relay_url", "") if pconf else ""
+                )
+                return gate, validate, helper, runtime_relay
+            finally:
+                reset_hermes_home_override(token)
+                _os.environ.pop("BUZZ_RELAY_URL", None)
+
+        # (a) Relay from legacy gateway.json, credentials from config.yaml:
+        #     both layers compose at runtime, so both must compose for the gate.
+        (tmp_path / "gateway.json").write_text(
+            json.dumps(
+                {"platforms": {"buzz": {"enabled": True, "extra": {
+                    "relay_url": "https://legacy.relay"}}}}
+            ),
+            encoding="utf-8",
+        )
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"gateway": {"platforms": {"buzz": {"extra": {
+                    "credentials_file": str(creds)}}}}}
+            ),
+            encoding="utf-8",
+        )
+        gate, validate, helper, runtime = evaluate()
+        assert runtime == "https://legacy.relay"
+        assert helper.get("relay_url") == runtime
+        assert helper.get("credentials_file") == str(creds)
+        assert gate is True and validate is True
+
+        # (b) Managed-scope-only Buzz config: user config.yaml has no buzz
+        #     block; the administrator overlay supplies it. Loader and gate
+        #     must both accept.
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"gateway": {"platforms": {"buzz": {"enabled": True, "extra": {
+                    "relay_url": "https://managed.relay",
+                    "credentials_file": str(creds),
+                }}}}}
+            ),
+            encoding="utf-8",
+        )
+        from hermes_cli import managed_scope as _managed_scope
+
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        _managed_scope.invalidate_managed_cache()
+        try:
+            (tmp_path / "config.yaml").write_text(
+                yaml.safe_dump({"model": {"default": "x"}}), encoding="utf-8"
+            )
+            (tmp_path / "gateway.json").unlink()
+            gate, validate, helper, runtime = evaluate()
+            assert runtime == "https://managed.relay"
+            assert helper.get("relay_url") == runtime
+            assert gate is True and validate is True
+        finally:
+            monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+            _managed_scope.invalidate_managed_cache()
+
+        # A managed config is not loaded by load_gateway_config() when the
+        # user's config.yaml is absent. The gate must not over-accept that
+        # managed-only file either.
+        (tmp_path / "config.yaml").unlink()
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        _managed_scope.invalidate_managed_cache()
+        try:
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                loaded = load_gateway_config()
+                pconf = loaded.platforms.get(Platform("buzz"))
+                assert pconf is None or not pconf.extra.get("relay_url")
+                assert _buzz_mod._read_profile_buzz_extra() == {}
+                assert check_requirements() is False
+            finally:
+                reset_hermes_home_override(token)
+        finally:
+            monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+            _managed_scope.invalidate_managed_cache()
+
     def test_scoped_gate_ignores_top_level_buzz_config(
         self, multiplex_scope, default_profile_env, monkeypatch, tmp_path
     ):
@@ -670,6 +807,63 @@ class TestMultiplexProfileScope:
         )
         assert result.get("success") is True
         assert calls["relay"] == "https://profile.relay"
+
+    def test_standalone_mention_retry_preserves_auth_tag(self, monkeypatch, tmp_path):
+        """Owner-gated standalone retries must carry the same auth tag as the
+        initial send after unresolved presentation-mention recovery."""
+        from gateway.config import PlatformConfig
+
+        cli = tmp_path / "buzz"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        auth_tag = '["auth","owner-tag","","proof"]'
+        seen_tags = []
+        attempts = 0
+
+        async def fake_exec(
+            cli_path,
+            args,
+            *,
+            relay_url,
+            private_key,
+            auth_tag="",
+            input_text=None,
+            timeout=None,
+        ):
+            nonlocal attempts
+            attempts += 1
+            seen_tags.append(auth_tag)
+            if attempts == 1:
+                return (
+                    1,
+                    "",
+                    "mention '@session' does not match a current channel member; "
+                    "retry with --mention <pubkey>",
+                )
+            return 0, '{"accepted": true, "event_id": "retry-event"}', ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "key")
+        monkeypatch.setattr(_buzz_mod, "_resolve_auth_tag", lambda extra=None: auth_tag)
+        monkeypatch.setattr(
+            _buzz_mod,
+            "_escape_unresolved_presentation_mention",
+            lambda message, err: message.replace("@session", "@\\u200bsession"),
+        )
+
+        result = asyncio.run(
+            _standalone_send(
+                PlatformConfig(
+                    enabled=True,
+                    extra={"relay_url": "https://relay", "cli_path": str(cli)},
+                ),
+                "channel",
+                "hello @session",
+            )
+        )
+
+        assert result == {"success": True, "message_id": "retry-event"}
+        assert attempts == 2
+        assert seen_tags == [auth_tag, auth_tag]
 
     def test_secondary_reply_to_mode_wins_over_default_profile_env(
         self, multiplex_scope, default_profile_env, monkeypatch

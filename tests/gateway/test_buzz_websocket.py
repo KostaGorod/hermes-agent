@@ -300,6 +300,62 @@ async def test_websocket_loop_dispatches_frames_and_closes_cleanly(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_websocket_loop_clean_close_has_no_warning_or_backoff(monkeypatch, caplog):
+    """Round-4 review: a server-side clean close (StopAsyncIteration) is a
+    NORMAL lifecycle event — the pre-liveness-refactor code caught it and
+    exited the connection without a disconnect warning or backoff sleep.
+    The generic exception handler must not turn it into a noisy reconnect:
+    reconnect happens, but immediately (no sleep) and without the warning.
+    """
+    import logging
+
+    adapter = _make_adapter()
+    adapter._channel_state = {CHANNEL: {"last_ts": 1, "seen": {}}}
+
+    async def closed_anext():
+        raise StopAsyncIteration
+
+    sockets = []
+    connects = []
+    backoff_delays = []
+    real_sleep = asyncio.sleep
+
+    async def track_sleep(delay, *args, **kwargs):
+        if delay == 1.0:
+            backoff_delays.append(delay)
+            return
+        await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", track_sleep)
+
+    def fake_connect(*args, **kwargs):
+        connects.append(1)
+        # Second connect ends the loop via CancelledError (reaching a second
+        # connect quickly proves no backoff sleep happened in between).
+        if len(connects) == 2:
+            raise asyncio.CancelledError()
+        ws = _ScriptedWebSocket(closed_anext)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+    caplog.set_level(logging.WARNING, logger=_buzz_mod.logger.name)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10.0)
+
+    assert len(connects) == 2, "clean close did not lead to an immediate reconnect"
+    assert not backoff_delays, "clean close must not use reconnect backoff"
+    assert sockets[0].exited
+    assert not any(
+        "WebSocket disconnected" in record.message for record in caplog.records
+    ), "clean close must not log a disconnect warning"
+
+
+@pytest.mark.asyncio
 async def test_websocket_auth_raises_on_rejection():
     adapter = _make_adapter()
 

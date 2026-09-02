@@ -2385,9 +2385,16 @@ class BuzzAdapter(BasePlatformAdapter):
                                 # answer within _WS_LIVENESS_TIMEOUT; an
                                 # unanswered probe — or any transport error
                                 # — raises into the reconnect path.
-                                raw = await self._read_frame_or_probe(
-                                    frame_iter, websocket
-                                )
+                                try:
+                                    raw = await self._read_frame_or_probe(
+                                        frame_iter, websocket
+                                    )
+                                except StopAsyncIteration:
+                                    # A normal async-iterator close is a clean
+                                    # relay lifecycle event, not a transport
+                                    # failure. Leave the connection context and
+                                    # reconnect without warning or backoff.
+                                    break
                                 try:
                                     message = json.loads(raw)
                                 except (ValueError, TypeError):
@@ -3549,11 +3556,48 @@ def _read_profile_buzz_extra() -> dict:
         from hermes_constants import get_hermes_home
         from hermes_cli.config import read_user_config_raw
 
-        cfg = read_user_config_raw(Path(get_hermes_home()) / "config.yaml")
+        home = Path(get_hermes_home())
+        config_yaml_path = home / "config.yaml"
+        cfg = read_user_config_raw(config_yaml_path)
     except Exception:
         return {}
     if not isinstance(cfg, dict):
-        return {}
+        cfg = {}
+
+    # Managed scope: the loader overlays administrator-pinned values on the
+    # user's config.yaml before any Buzz block is read (gateway/config.py
+    # ``apply_managed_overlay`` at the top of load_gateway_config), and the
+    # YAML→env bridge dispatch runs on that overlaid view. The gate must see
+    # the same composition. The loader only enters that branch when the user
+    # config.yaml exists, so an absent user file must not make a managed-only
+    # Buzz block visible here. Fail-open, exactly like the loader.
+    if config_yaml_path.exists():
+        try:
+            from hermes_cli import managed_scope as _managed_scope
+
+            cfg = _managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+
+    # Legacy base layer: gateway.json's platforms map is where the loader
+    # starts its platform merge (``gw_data.setdefault("platforms", {})``);
+    # YAML nested extras overlay it via ``_merge_platform_map`` order. The
+    # bridge dispatch, by contrast, consults only the YAML view — so
+    # gateway.json contributes to merged extra but never to bridge
+    # selection, mirroring ``apply_yaml_config_fn``'s inputs.
+    legacy_extra: dict = {}
+    try:
+        legacy_path = home / "gateway.json"
+        if legacy_path.exists():
+            with open(legacy_path, "r", encoding="utf-8") as f:
+                legacy = json.load(f) or {}
+            legacy_plat = (legacy.get("platforms") or {}).get("buzz")
+            if isinstance(legacy_plat, dict):
+                _lx = legacy_plat.get("extra")
+                if isinstance(_lx, dict):
+                    legacy_extra = _lx
+    except Exception:
+        legacy_extra = {}
 
     def _section(source, key) -> dict:
         if not isinstance(source, dict):
@@ -3561,9 +3605,21 @@ def _read_profile_buzz_extra() -> dict:
         value = source.get(key)
         return value if isinstance(value, dict) else {}
 
+    def _block_or_none(source, key):
+        # Loader presence semantics (gateway/config.py apply_yaml_config_fn
+        # dispatch): a block is selected when it is a dict — including an
+        # explicitly empty ``{}``, which STOPS the candidate search exactly
+        # like a populated block. ``None`` (absent or non-dict) falls through.
+        if not isinstance(source, dict):
+            return None
+        value = source.get(key)
+        return value if isinstance(value, dict) else None
+
     def _extra_of(block) -> dict:
         # Extra-or-bare, mirroring ``_apply_yaml_config``'s view of the
         # block it is dispatched on.
+        if not isinstance(block, dict):
+            return {}
         extra = block.get("extra", block)
         return extra if isinstance(extra, dict) else {}
 
@@ -3571,26 +3627,41 @@ def _read_profile_buzz_extra() -> dict:
         # Nested blocks contribute ONLY their ``extra:`` sub-key to the
         # runtime merge (gateway/config.py ``_merge_platform_map`` merges
         # ``plat_block.get("extra", {})``); bare keys are dropped.
+        if not isinstance(block, dict):
+            return {}
         extra = block.get("extra")
         return extra if isinstance(extra, dict) else {}
 
     gateway_cfg = _section(cfg, "gateway")
-    gw_platforms_block = _section(_section(gateway_cfg, "platforms"), "buzz")
-    platforms_block = _section(_section(cfg, "platforms"), "buzz")
+    gw_platforms_src = _section(gateway_cfg, "platforms")
+    platforms_src = _section(cfg, "platforms")
+    gw_platforms_block = _block_or_none(gw_platforms_src, "buzz")
+    platforms_block = _block_or_none(platforms_src, "buzz")
+    gateway_buzz_block = _block_or_none(gateway_cfg, "buzz")
 
-    merged: dict = {}
-    for block in (gw_platforms_block, platforms_block, _section(gateway_cfg, "buzz")):
+    merged: dict = dict(legacy_extra)
+    for block in (gw_platforms_block, platforms_block, gateway_buzz_block):
         merged.update(_extra_only(block))
 
-    top_block = _section(cfg, "buzz")
+    top_block = _block_or_none(cfg, "buzz")
     if _profile_scoped():
         # Secondary profile scope: no env bridge, and top-level ``buzz:``
         # never lands in PlatformConfig.extra — it is inert here.
         return merged
 
     # Unscoped: bridged keys resolve through the ONE bridge block, truthy
-    # values only, overriding the nested merge (env beats extra).
-    bridge_block = top_block or gw_platforms_block or platforms_block
+    # values only, overriding the nested merge (env beats extra). Selection
+    # mirrors the loader: the first block that is a dict wins — a
+    # present-but-empty top-level ``buzz: {}`` therefore suppresses
+    # bridging from the nested blocks instead of falling through to them.
+    bridge_block = next(
+        (
+            block
+            for block in (top_block, gw_platforms_block, platforms_block)
+            if block is not None
+        ),
+        {},
+    )
     bridge_extra = _extra_of(bridge_block)
     for key in _BRIDGED_EXTRA_KEYS:
         value = bridge_extra.get(key)
@@ -3844,6 +3915,7 @@ async def _standalone_send(
                     args,
                     relay_url=relay,
                     private_key=private_key,
+                    auth_tag=auth_tag,
                     input_text=escaped,
                 )
     except asyncio.CancelledError:
