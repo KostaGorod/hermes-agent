@@ -53,7 +53,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -326,13 +326,16 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
-# Last-resort bound on how long the read loop may wait for a frame. The
-# library keepalive (ping_interval/ping_timeout below) should catch a dead
-# relay first, but a relay-side close the transport never surfaces (observed
-# as a CLOSE_WAIT socket with the loop parked on recv, #98097) leaves the
-# gateway "connected" while inbound stops; this timeout forces the normal
-# reconnect path instead.
-_WS_READ_IDLE_TIMEOUT = 300.0
+# Last-resort liveness probe for the read loop. The library keepalive
+# (ping_interval/ping_timeout below) should catch a dead relay first, but a
+# relay-side close the transport never surfaces (observed as a CLOSE_WAIT
+# socket with the loop parked on recv, #98097) leaves the gateway
+# "connected" while inbound stops: in that state the pending pong waiter
+# never completes, so a manual ping round-trip times out and forces the
+# normal reconnect path. A quiet-but-healthy relay answers the ping and the
+# connection is kept — silence alone is not death.
+_WS_LIVENESS_INTERVAL = 60.0
+_WS_LIVENESS_TIMEOUT = 45.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
@@ -569,8 +572,17 @@ def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
     # never the default profile's os.environ); unscoped reads keep env
     # precedence plus the external-secret rung.
     configured = str(_get_scoped_secret("BUZZ_CREDENTIALS_FILE", "") or "").strip() or str(
-        (extra or {}).get("credentials_file", "") or ""
+        (extra or {}).get("credentials_file", "")
     ).strip()
+    if not configured and not _profile_scoped():
+        # Unscoped gate path (#98738 default profile under multiplex): the
+        # startup gate receives no PlatformConfig, so the profile's own
+        # config.yaml ``buzz.extra.credentials_file`` is the last place the
+        # file can be declared before failing closed. Under multiplex the
+        # glob below would cross profiles (#98738), but reading THIS
+        # profile's config is exactly the isolation the scoped path has.
+        extra_cfg = _read_profile_buzz_extra()
+        configured = str((extra_cfg or {}).get("credentials_file", "")).strip()
     if configured:
         return [Path(configured).expanduser()]
     if _is_multiplex_active():
@@ -2265,6 +2277,72 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("Buzz: WebSocket discovery sweep failed", exc_info=True)
 
+    async def _probe_liveness(self, frame_iter) -> None:
+        """Demand proof of transport life via a ping/pong round-trip.
+
+        Real websockets connections are their own iterator and expose
+        ``ping()`` — awaiting it sends the ping and returns a pong waiter,
+        which is then awaited here. In the #98097 shape (socket parked in
+        CLOSE_WAIT), the send succeeds into the kernel buffer but the waiter
+        never completes, so the caller's timeout fires. Test doubles without
+        a ping surface return immediately: their liveness is their ``recv()``
+        behavior. Transport errors (ConnectionClosed) propagate to the
+        reconnect path.
+        """
+        for target in (frame_iter, frame_iter.__aiter__() if hasattr(frame_iter, "__aiter__") else None):
+            if target is None:
+                continue
+            ping_fn = getattr(target, "ping", None)
+            if callable(ping_fn):
+                pong_waiter = await cast("Awaitable[Any]", ping_fn())
+                if pong_waiter is not None:
+                    await pong_waiter
+                return
+
+    async def _read_frame_or_probe(self, frame_iter) -> str:
+        """Await the next frame, probing transport liveness while quiet.
+
+        Race the raw frame read against a periodic ping round-trip. When a
+        frame arrives first it is returned untouched. When the frame read has
+        been quiet for ``_WS_LIVENESS_INTERVAL`` seconds, send a ping that the
+        relay must answer within ``_WS_LIVENESS_TIMEOUT``: an answer proves the
+        transport is alive and the read keeps waiting (a quiet relay is not a
+        dead relay); no answer means the connection went silent (#98097) and
+        this raises ``ConnectionError`` into the reconnect path. Any error from
+        the transport itself propagates unchanged.
+        """
+        read_task = asyncio.ensure_future(frame_iter.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {read_task},
+                    timeout=_WS_LIVENESS_INTERVAL,
+                )
+                if done:
+                    return read_task.result()
+                # Quiet for one interval: demand proof of life.
+                try:
+                    await asyncio.wait_for(
+                        self._probe_liveness(frame_iter),
+                        timeout=_WS_LIVENESS_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    raise ConnectionError(
+                        "relay did not answer a liveness ping within "
+                        f"{_WS_LIVENESS_TIMEOUT:.0f}s; assuming the "
+                        "connection went silent"
+                    ) from None
+                # Alive but quiet: keep waiting for the next frame.
+        finally:
+            # Cancel is a no-op on a completed task; awaiting retrieves the
+            # outcome either way so a completed-with-exception recv can't
+            # surface as "exception was never retrieved" noise.
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
         backoff. Events route through _handle_event() — identical semantics
@@ -2300,18 +2378,17 @@ class BuzzAdapter(BasePlatformAdapter):
                         try:
                             frame_iter = websocket.__aiter__()
                             while True:
-                                try:
-                                    raw = await asyncio.wait_for(
-                                        frame_iter.__anext__(),
-                                        timeout=_WS_READ_IDLE_TIMEOUT,
-                                    )
-                                except StopAsyncIteration:
-                                    break
-                                except asyncio.TimeoutError:
-                                    raise ConnectionError(
-                                        f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; "
-                                        "assuming the connection went silent"
-                                    ) from None
+                                # Wait for the next frame while probing
+                                # transport liveness. A silent relay is not
+                                # necessarily dead (#98097's CLOSE_WAIT
+                                # shape vs. a simply quiet night), so the
+                                # probe is a ping round-trip the relay must
+                                # answer within _WS_LIVENESS_TIMEOUT; an
+                                # unanswered probe — or any transport error
+                                # — raises into the reconnect path.
+                                raw = await self._read_frame_or_probe(
+                                    frame_iter
+                                )
                                 try:
                                     message = json.loads(raw)
                                 except (ValueError, TypeError):
@@ -3431,6 +3508,19 @@ def _profile_buzz_extra() -> dict:
     """
     if not _profile_scoped():
         return {}
+    return _read_profile_buzz_extra()
+
+
+def _read_profile_buzz_extra() -> dict:
+    """Read ``buzz.extra`` from the active hermes home's config.yaml.
+
+    Shared by the scoped gate (secondary multiplex profiles, where the
+    hermes-home override points at that profile's home) and the unscoped
+    default-profile gate: ``check_requirements()`` receives no
+    ``PlatformConfig``, so a ``credentials_file`` declared only in config.yaml
+    is otherwise invisible to it. Best-effort — any failure yields an empty
+    mapping and the caller fails closed.
+    """
     try:
         from hermes_constants import get_hermes_home
         from hermes_cli.config import read_user_config_raw

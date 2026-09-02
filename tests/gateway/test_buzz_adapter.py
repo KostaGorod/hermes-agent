@@ -336,6 +336,69 @@ class TestMultiplexProfileScope:
         finally:
             reset_hermes_home_override(token)
 
+    def test_unscoped_gate_resolves_credentials_file_from_profile_config(
+        self, monkeypatch, tmp_path
+    ):
+        """Default-profile boot (#98748 deploy): the gate runs before the
+        YAML→env bridge pins anything (and ``credentials_file`` is never
+        bridged), so a ``buzz.extra.credentials_file`` declared only in
+        config.yaml must still satisfy ``check_requirements``."""
+        import yaml
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        creds = tmp_path / "hermes.json"
+        creds.write_text(json.dumps({"nsec": "nsec1fromprofilecfg"}), encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "gateway": {
+                        "platforms": {
+                            "buzz": {
+                                "enabled": True,
+                                "extra": {
+                                    "relay_url": "https://default.relay",
+                                    "credentials_file": str(creds),
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        # No BUZZ_CREDENTIALS_FILE / BUZZ_PRIVATE_KEY in env: the unscoped
+        # gate must fall through to the profile's config.yaml for the key.
+        # Pin the glob dir so a developer's real ~/.config/buzz cannot
+        # satisfy the gate through the legacy fallback rung.
+        for var in ("BUZZ_RELAY_URL", "BUZZ_CREDENTIALS_FILE", "BUZZ_PRIVATE_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(
+            _buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here"
+        )
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://default.relay")
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is True
+        finally:
+            reset_hermes_home_override(token)
+
+        # And a config.yaml with no credentials anywhere still fails closed.
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"gateway": {"platforms": {"buzz": {"enabled": True, "extra": {"relay_url": "https://r"}}}}}
+            ),
+            encoding="utf-8",
+        )
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is False
+        finally:
+            reset_hermes_home_override(token)
+
+
     def test_env_enablement_scoped_returns_none(self, multiplex_scope, default_profile_env):
         """Scoped env enablement must not fabricate Buzz for a profile from
         the default profile's env values."""
