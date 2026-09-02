@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 from gateway.platforms.base import CachedMedia, MessageType
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
-from gateway.platforms.base import MessageType
 
 # Load plugins/platforms/buzz/adapter.py under a unique module name
 # (plugin_adapter_buzz) so it cannot collide with other plugin adapters
@@ -83,7 +83,12 @@ def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind
 def _make_adapter(extra=None):
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})})
+    # Keep legacy adapter tests focused on their own behavior. Reaction
+    # lifecycle coverage uses its dedicated test module and opts in there.
+    cfg = PlatformConfig(
+        enabled=True,
+        extra={"relay_url": "https://test.relay", "reactions": False, **(extra or {})},
+    )
     adapter = BuzzAdapter(cfg)
     adapter._self_pubkey = SELF_PUBKEY
     adapter._self_npub = SELF_NPUB
@@ -331,6 +336,286 @@ class TestMultiplexProfileScope:
         finally:
             reset_hermes_home_override(token)
 
+    def test_unscoped_gate_resolves_credentials_file_from_profile_config(
+        self, monkeypatch, tmp_path
+    ):
+        """Default-profile boot (#98748 deploy): the gate runs before the
+        YAML→env bridge pins anything (and ``credentials_file`` is never
+        bridged), so a ``buzz.extra.credentials_file`` declared only in
+        config.yaml must still satisfy ``check_requirements`` — in every
+        location the gateway loader accepts (``gateway.platforms.buzz``,
+        ``platforms.buzz``, and top-level ``buzz:``)."""
+        import yaml
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        def write_config(location):
+            creds = tmp_path / "hermes.json"
+            creds.write_text(json.dumps({"nsec": "nsec1fromprofilecfg"}), encoding="utf-8")
+            extra = {"relay_url": "https://default.relay", "credentials_file": str(creds)}
+            if location == "gateway.platforms.buzz":
+                cfg = {"gateway": {"platforms": {"buzz": {"enabled": True, "extra": extra}}}}
+            elif location == "platforms.buzz":
+                cfg = {"platforms": {"buzz": {"enabled": True, "extra": extra}}}
+            else:  # top-level buzz:
+                cfg = {"buzz": {"enabled": True, "extra": extra}}
+            (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        # No BUZZ_CREDENTIALS_FILE / BUZZ_PRIVATE_KEY in env: the unscoped
+        # gate must fall through to the profile's config.yaml for the key.
+        # Pin the glob dir so a developer's real ~/.config/buzz cannot
+        # satisfy the gate through the legacy fallback rung.
+        for var in ("BUZZ_RELAY_URL", "BUZZ_CREDENTIALS_FILE", "BUZZ_PRIVATE_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(
+            _buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here"
+        )
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://default.relay")
+        for location in ("gateway.platforms.buzz", "platforms.buzz", "top-level buzz"):
+            write_config(location)
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                assert check_requirements() is True, f"gate failed for {location}"
+            finally:
+                reset_hermes_home_override(token)
+
+        # Composed shapes the loader supports (gateway/config.py:1599-1637):
+        # nested locations deep-merge in loader order — gateway.platforms.buzz
+        # first, platforms.buzz overlays it, gateway.buzz overlays last — and
+        # the top-level block only fills gaps (it never lands in extra; its
+        # bridged keys seed env only where unset). The gate must accept what
+        # the loader composes.
+        creds = tmp_path / "hermes.json"
+        creds.write_text(json.dumps({"nsec": "nsec1splitcfg"}), encoding="utf-8")
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here")
+
+        def write_yaml(cfg):
+            (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+        def gate_under_home():
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                return check_requirements()
+            finally:
+                reset_hermes_home_override(token)
+
+        # (a) Split across nested locations: relay under gateway.platforms.buzz,
+        #     credentials_file under platforms.buzz → merged extra has both.
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"enabled": True, "extra": {"relay_url": "https://a.relay"}}}},
+                "platforms": {"buzz": {"extra": {"credentials_file": str(creds)}}},
+            }
+        )
+        assert gate_under_home() is True, (
+            "split nested config (relay + credentials_file) must pass the gate"
+        )
+
+        # (b) Precedence: platforms.buzz overrides gateway.platforms.buzz.
+        marker_creds = tmp_path / "marker-hermes.json"
+        marker_creds.write_text(json.dumps({"nsec": "nsec1marker"}), encoding="utf-8")
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"extra": {"credentials_file": str(marker_creds)}}}},
+                "platforms": {"buzz": {"extra": {"credentials_file": str(creds)}}},
+            }
+        )
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is True
+            assert _buzz_mod._credentials_candidates() == [
+                _buzz_mod.Path(str(creds)).expanduser()
+            ]
+        finally:
+            reset_hermes_home_override(token)
+
+        # (c) Top-level buzz: fills gaps but does not override nested extra.
+        top_creds = tmp_path / "top-hermes.json"
+        top_creds.write_text(json.dumps({"nsec": "nsec1top"}), encoding="utf-8")
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"extra": {"relay_url": "https://nested.relay"}}}},
+                "buzz": {"extra": {"credentials_file": str(top_creds)}},
+            }
+        )
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is True
+            assert _buzz_mod._credentials_candidates() == [
+                _buzz_mod.Path(str(top_creds)).expanduser()
+            ]
+        finally:
+            reset_hermes_home_override(token)
+
+        # (d) Config-only relay: the gate runs before load_gateway_config's
+        #     YAML→env bridge, but the bridge seeds BUZZ_RELAY_URL where env
+        #     is unset — so the gate must not fail a config-only relay.
+        creds2 = tmp_path / "hermes2.json"
+        creds2.write_text(json.dumps({"nsec": "nsec1relayonly"}), encoding="utf-8")
+        write_yaml(
+            {
+                "gateway": {"platforms": {"buzz": {"extra": {
+                    "relay_url": "https://cfgonly.relay",
+                    "credentials_file": str(creds2),
+                }}}},
+            }
+        )
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        assert gate_under_home() is True
+
+        # And a config.yaml with no credentials anywhere still fails closed.
+        write_yaml(
+            {"gateway": {"platforms": {"buzz": {"enabled": True, "extra": {"relay_url": "https://r"}}}}}
+        )
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            assert check_requirements() is False
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_gate_view_matches_loader_effective_config(self, monkeypatch, tmp_path):
+        """Round-3 review: the gate's config view must equal what the loader
+        composes — value-level, not just presence-level.
+
+        Runtime relay precedence (gateway/config.py:1599-1637 nested merge +
+        the plugin bridge dispatch at 1816-1846 feeding
+        adapter._apply_yaml_config): env wins; else the ONE bridge block
+        (top-level ``buzz:`` if present, else ``gateway.platforms.buzz``,
+        else ``platforms.buzz``) seeds its truthy bridged keys into env;
+        else merged nested extra (each block's ``extra:`` sub-key only;
+        ``gateway.buzz`` overlays last, and bare keys in any nested block
+        never become extra). So an empty-string override in a later block
+        does NOT clear the relay the bridge seeded from an earlier block.
+        """
+        import os as _os
+        import yaml
+        from gateway.config import Platform, load_gateway_config
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"nsec": "nsec1compose"}), encoding="utf-8")
+        missing = tmp_path / "missing.json"  # never created; must be ignored
+
+        for var in ("BUZZ_RELAY_URL", "BUZZ_CREDENTIALS_FILE", "BUZZ_PRIVATE_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(
+            _buzz_mod, "_DEFAULT_CREDENTIALS_DIR", tmp_path / "no-glob-here"
+        )
+
+        def evaluate(cfg):
+            """Load under this home; return (gate, validate, helper, runtime)."""
+            (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+            _os.environ.pop("BUZZ_RELAY_URL", None)
+            token = set_hermes_home_override(str(tmp_path))
+            try:
+                loaded = load_gateway_config()
+                pconf = loaded.platforms.get(Platform("buzz"))
+                helper = _buzz_mod._read_profile_buzz_extra()
+                gate = check_requirements()
+                validate = _buzz_mod.validate_config(pconf) if pconf else False
+                runtime_relay = _os.environ.get("BUZZ_RELAY_URL", "") or (
+                    pconf.extra.get("relay_url", "") if pconf else ""
+                )
+                return gate, validate, helper, runtime_relay
+            finally:
+                reset_hermes_home_override(token)
+                _os.environ.pop("BUZZ_RELAY_URL", None)
+
+        monkeypatch.setattr(_buzz_mod, "_UNSCOPED_PROFILE_SECRETS", None)
+
+        gw_plat = {"extra": {"relay_url": "https://gp", "credentials_file": str(creds)}}
+
+        # Empty-string relay override in a later block must not clear the
+        # relay bridged from gateway.platforms.buzz (env beats extra).
+        for cfg in (
+            {"gateway": {"platforms": {"buzz": gw_plat}},
+             "platforms": {"buzz": {"extra": {"relay_url": ""}}}},
+            {"gateway": {"platforms": {"buzz": gw_plat},
+                         "buzz": {"extra": {"relay_url": ""}}}},
+        ):
+            gate, validate, helper, runtime = evaluate(cfg)
+            assert runtime == "https://gp", cfg
+            assert helper.get("relay_url") == runtime, cfg
+            assert gate is True and validate is True, cfg
+
+        # gateway.buzz BARE keys never become extra: a bogus direct
+        # credentials_file must not mask the valid nested one.
+        cfg = {"gateway": {"platforms": {"buzz": gw_plat},
+                           "buzz": {"credentials_file": str(missing)}}}
+        gate, validate, helper, runtime = evaluate(cfg)
+        assert helper.get("credentials_file") == str(creds)
+        assert gate is True and validate is True
+
+        # All four locations with conflicting relays: the bridge block
+        # (top-level) supplies the runtime value; the helper must agree.
+        cfg = {
+            "gateway": {
+                "platforms": {"buzz": {"extra": {
+                    "relay_url": "https://gwplat", "credentials_file": str(creds)}}},
+                "buzz": {"extra": {"relay_url": "https://gwdirect"}},
+            },
+            "platforms": {"buzz": {"extra": {"relay_url": "https://plats"}}},
+            "buzz": {"extra": {"relay_url": "https://top"}},
+        }
+        gate, validate, helper, runtime = evaluate(cfg)
+        assert runtime == "https://top"
+        assert helper.get("relay_url") == runtime
+        assert gate is True and validate is True
+
+        # Three nested locations, no top-level block: the bridge falls back
+        # to gateway.platforms.buzz, overriding gateway.buzz's extra overlay.
+        cfg = {k: v for k, v in cfg.items() if k != "buzz"}
+        gate, validate, helper, runtime = evaluate(cfg)
+        assert runtime == "https://gwplat"
+        assert helper.get("relay_url") == runtime
+        assert gate is True and validate is True
+
+    def test_scoped_gate_ignores_top_level_buzz_config(
+        self, multiplex_scope, default_profile_env, monkeypatch, tmp_path
+    ):
+        """Round-3 review: under a secondary profile scope the YAML→env
+        bridge is disabled and top-level ``buzz:`` never reaches
+        PlatformConfig.extra — a profile configured ONLY via top-level
+        ``buzz:`` is unconfigured at runtime, so the scoped gate must
+        fail closed instead of green-lighting it."""
+        import yaml
+        from gateway.config import Platform, load_gateway_config
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        creds = tmp_path / "creds.json"
+        creds.write_text(json.dumps({"nsec": "nsec1toponly"}), encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"buzz": {"enabled": True, "extra": {
+                    "relay_url": "https://top.relay",
+                    "credentials_file": str(creds),
+                }}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("BUZZ_RELAY_URL", raising=False)
+        multiplex_scope()
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            loaded = load_gateway_config()
+            pconf = loaded.platforms.get(Platform("buzz"))
+            extra = dict(pconf.extra) if pconf else {}
+            assert "relay_url" not in extra, "top-level buzz must not reach scoped extra"
+            assert check_requirements() is False
+            if pconf is not None:
+                assert _buzz_mod.validate_config(pconf) is False
+        finally:
+            reset_hermes_home_override(token)
+
+
     def test_env_enablement_scoped_returns_none(self, multiplex_scope, default_profile_env):
         """Scoped env enablement must not fabricate Buzz for a profile from
         the default profile's env values."""
@@ -385,6 +670,106 @@ class TestMultiplexProfileScope:
         )
         assert result.get("success") is True
         assert calls["relay"] == "https://profile.relay"
+
+    def test_secondary_reply_to_mode_wins_over_default_profile_env(
+        self, multiplex_scope, default_profile_env, monkeypatch
+    ):
+        """reply_to_mode is a first-class PlatformConfig field, not an extra
+        key, but must still respect profile scope like every other setting:
+        the default profile's BUZZ_REPLY_TO_MODE bridge output must not
+        override the secondary profile's own reply_to_mode."""
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("BUZZ_REPLY_TO_MODE", "first")
+        multiplex_scope()
+        adapter = BuzzAdapter(PlatformConfig(enabled=True, reply_to_mode="off", extra={}))
+        assert adapter._reply_to_mode == "off"
+
+    def test_secondary_reply_in_thread_wins_over_default_profile_env(
+        self, multiplex_scope, default_profile_env, monkeypatch
+    ):
+        """extra.reply_in_thread must win over the default profile's
+        BUZZ_REPLY_IN_THREAD bridge output under a secondary profile scope."""
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("BUZZ_REPLY_IN_THREAD", "true")
+        multiplex_scope()
+        adapter = BuzzAdapter(
+            PlatformConfig(enabled=True, extra={"reply_in_thread": False})
+        )
+        assert adapter._reply_to_mode == "off"
+
+    def test_secondary_reaction_only_users_wins_over_default_profile_env(
+        self, multiplex_scope, default_profile_env, monkeypatch
+    ):
+        """reaction_only_users must respect profile scope like allowed_users
+        (#98738): the default profile's BUZZ_REACTION_ONLY_USERS bridge
+        output must not override the secondary profile's own
+        extra.reaction_only_users."""
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("BUZZ_REACTION_ONLY_USERS", "default-user-npub")
+        multiplex_scope()
+        adapter = BuzzAdapter(
+            PlatformConfig(enabled=True, extra={"reaction_only_users": [SELF_NPUB]})
+        )
+        assert adapter._reaction_only_pubkeys == {SELF_PUBKEY}
+
+    def test_apply_yaml_config_scoped_skips_reply_settings_env_bridge(
+        self, multiplex_scope, default_profile_env, monkeypatch
+    ):
+        """Same first-writer-wins protection as
+        test_apply_yaml_config_scoped_skips_env_bridge, for the
+        reply_to_mode / reply_in_thread bridge lines specifically."""
+        for var in ("BUZZ_REPLY_TO_MODE", "BUZZ_REPLY_IN_THREAD"):
+            monkeypatch.delenv(var, raising=False)
+        multiplex_scope()
+        _buzz_mod._apply_yaml_config(
+            {},
+            {"extra": {"reply_to_mode": "off", "reply_in_thread": False}},
+        )
+        import os as _os
+
+        assert "BUZZ_REPLY_TO_MODE" not in _os.environ
+        assert "BUZZ_REPLY_IN_THREAD" not in _os.environ
+
+    def test_standalone_send_scoped_reply_to_mode_uses_profile_config(
+        self, multiplex_scope, default_profile_env, monkeypatch, tmp_path
+    ):
+        """cron delivery (out-of-process _standalone_send) must honor the
+        profile's own reply_to_mode, not the default profile's
+        BUZZ_REPLY_TO_MODE bridge output."""
+        monkeypatch.setenv("BUZZ_REPLY_TO_MODE", "first")
+        monkeypatch.delenv("BUZZ_REPLY_IN_THREAD", raising=False)
+        multiplex_scope()
+        from gateway.config import PlatformConfig
+
+        cli = tmp_path / "buzz"
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        calls = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=None):
+            calls["args"] = args
+            return 0, '{"accepted": true, "event_id": "e1"}', ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1profile"
+        )
+        result = asyncio.run(
+            _standalone_send(
+                PlatformConfig(
+                    enabled=True,
+                    reply_to_mode="off",
+                    extra={"relay_url": "https://profile.relay", "cli_path": str(cli)},
+                ),
+                "chan-x",
+                "hello",
+                thread_id="parent-event-id",
+            )
+        )
+        assert result.get("success") is True
+        assert "--reply-to" not in calls["args"]
 
     def test_secondary_partial_extra_fills_missing_keys_from_defaults(
         self, multiplex_scope, default_profile_env
@@ -3178,6 +3563,123 @@ class TestBuzzAdapterLifecycle:
         adapter._run_cli = cli
         assert await adapter.connect() is False
         assert adapter._lock_key is None
+
+    @pytest.mark.asyncio
+    async def test_connect_publishes_online_and_disconnect_publishes_offline(self, monkeypatch):
+        """A connected Buzz agent must have a visible presence record."""
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("users", "get", [{"pubkey": SELF_PUBKEY, "display_name": "Chip"}])
+        cli.script("channels", "list", [{"channel_id": CHANNEL, "name": "general"}])
+        adapter._run_cli = cli
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
+        monkeypatch.setattr(adapter, "_seed_channel", AsyncMock())
+        monkeypatch.setattr(adapter, "_discover_dms", AsyncMock())
+        monkeypatch.setattr(adapter, "_start_websocket", AsyncMock(return_value=True))
+
+        assert await adapter.connect() is True
+        assert [
+            args for args, _input in cli.calls
+            if args[:2] == ["users", "set-presence"]
+        ] == [["users", "set-presence", "--status", "online"]]
+
+        await adapter.disconnect()
+        assert [
+            args for args, _input in cli.calls
+            if args[:2] == ["users", "set-presence"]
+        ] == [
+            ["users", "set-presence", "--status", "online"],
+            ["users", "set-presence", "--status", "offline"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_presence_refreshes_until_cancelled(self):
+        """The heartbeat republishes online presence before relay expiry."""
+        adapter = _make_adapter()
+        adapter._presence_interval = 0.001
+        calls = []
+        refreshed = asyncio.Event()
+
+        async def record_presence(status):
+            calls.append(status)
+            if len(calls) >= 2:
+                refreshed.set()
+            return True
+
+        adapter._set_presence = record_presence
+        task = asyncio.create_task(adapter._presence_loop())
+        try:
+            await asyncio.wait_for(refreshed.wait(), timeout=1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert calls[0] == "online"
+        assert len(calls) >= 2
+
+    def test_refresh_interval_clamps_to_leave_margin_before_expiry(self):
+        """Cadence invariants: never later than expiry-minus-margin, never zero."""
+        assert _buzz_mod._presence_refresh_interval(60.0, 180.0, 120.0) == 60.0
+        # A configured cadence that would brush expiry is pulled earlier.
+        assert _buzz_mod._presence_refresh_interval(90.0, 100.0, 60.0) == 40.0
+        # A degenerate margin that leaves no headroom falls back to half the
+        # expiry as the ceiling; the configured cadence still applies when
+        # it is already tighter.
+        assert _buzz_mod._presence_refresh_interval(60.0, 180.0, 200.0) == 60.0
+        assert _buzz_mod._presence_refresh_interval(120.0, 180.0, 200.0) == 90.0
+        # The default cadence always refreshes before the record lapses.
+        assert (
+            _buzz_mod._presence_refresh_interval(
+                _buzz_mod._PRESENCE_INTERVAL,
+                _buzz_mod._PRESENCE_EXPIRY,
+                _buzz_mod._PRESENCE_REFRESH_MARGIN,
+            )
+            < _buzz_mod._PRESENCE_EXPIRY
+        )
+
+    @pytest.mark.asyncio
+    async def test_presence_first_and_repeat_refresh_lands_before_expiry(self):
+        """First refresh (and repeats) arrive before a short relay TTL lapses."""
+        adapter = _make_adapter()
+        adapter._presence_interval = 0.05  # configured cadence would brush expiry
+        adapter._presence_expiry = 0.06
+        adapter._presence_margin = 0.04
+        stamps = []
+        done = asyncio.Event()
+
+        async def record_presence(status):
+            stamps.append(time.monotonic())
+            if len(stamps) >= 2:
+                done.set()
+            return True
+
+        adapter._set_presence = record_presence
+        start = time.monotonic()
+        task = asyncio.create_task(adapter._presence_loop())
+        try:
+            await asyncio.wait_for(done.wait(), timeout=2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        # Effective cadence is expiry - margin = 0.02s; the first refresh
+        # must land well before the 0.06s TTL, and the second on cadence.
+        assert stamps[0] - start < adapter._presence_expiry
+        assert 0 < stamps[1] - stamps[0] < 2 * (
+            adapter._presence_expiry - adapter._presence_margin
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_presence_swallows_timeouts_but_not_cancellation(self):
+        adapter = _make_adapter()
+
+        async def raise_cancelled(status):
+            raise asyncio.CancelledError()
+
+        adapter._presence_task = None
+        adapter._set_presence = raise_cancelled
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._stop_presence()
 
 
 # ── Credentials / requirements ────────────────────────────────────────────

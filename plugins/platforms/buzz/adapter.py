@@ -27,6 +27,7 @@ Configuration in config.yaml::
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
             reply_in_thread: true      # false = post replies flat to the channel timeline
             reaction_only_users: []    # acknowledge explicit tags without dispatching; allowed_users wins on overlap
+            reactions: true             # emoji reaction lifecycle (👀 received → 🧠 working → ✅/❌ done); false disables
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
@@ -52,7 +53,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -173,6 +174,7 @@ from gateway.platforms.base import (
     SendResult,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     cache_media_bytes,
 )
 from gateway.config import Platform
@@ -239,6 +241,30 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+# Buzz relays document a 180-second expiry for presence records. Refresh at
+# most once a minute, leaving a two-minute margin even if the relay's clock or
+# delivery is delayed.
+_PRESENCE_EXPIRY = 180.0
+_PRESENCE_REFRESH_MARGIN = 120.0
+_PRESENCE_INTERVAL = min(60.0, _PRESENCE_EXPIRY - _PRESENCE_REFRESH_MARGIN)
+_REACTION_CLEANUP_INTERVAL = 60.0
+_REACTION_CLEANUP_TTL = 300.0
+
+
+def _presence_refresh_interval(refresh: float, expiry: float, margin: float) -> float:
+    """Effective presence-refresh interval for a relay TTL of ``expiry``.
+
+    The relay expires presence records after ``expiry`` seconds; the
+    effective cadence is the configured ``refresh`` clamped so every
+    refresh (including the first, scheduled right after the connect-time
+    ``online`` publish) lands at least ``margin`` seconds before the
+    record would lapse. A degenerate ``margin >= expiry`` falls back to
+    half the expiry rather than a zero/negative sleep.
+    """
+    bounded = expiry - margin
+    if bounded <= 0:
+        bounded = expiry / 2.0
+    return max(0.0, min(refresh, bounded))
 
 # Mention-resolution caches: member lists are cheap to refetch but hit on
 # every publish containing "@", so a short TTL amortizes the CLI round-trip;
@@ -300,13 +326,16 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
-# Last-resort bound on how long the read loop may wait for a frame. The
-# library keepalive (ping_interval/ping_timeout below) should catch a dead
-# relay first, but a relay-side close the transport never surfaces (observed
-# as a CLOSE_WAIT socket with the loop parked on recv, #98097) leaves the
-# gateway "connected" while inbound stops; this timeout forces the normal
-# reconnect path instead.
-_WS_READ_IDLE_TIMEOUT = 300.0
+# Last-resort liveness probe for the read loop. The library keepalive
+# (ping_interval/ping_timeout below) should catch a dead relay first, but a
+# relay-side close the transport never surfaces (observed as a CLOSE_WAIT
+# socket with the loop parked on recv, #98097) leaves the gateway
+# "connected" while inbound stops: in that state the pending pong waiter
+# never completes, so a manual ping round-trip times out and forces the
+# normal reconnect path. A quiet-but-healthy relay answers the ping and the
+# connection is kept — silence alone is not death.
+_WS_LIVENESS_INTERVAL = 60.0
+_WS_LIVENESS_TIMEOUT = 45.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
@@ -543,8 +572,17 @@ def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
     # never the default profile's os.environ); unscoped reads keep env
     # precedence plus the external-secret rung.
     configured = str(_get_scoped_secret("BUZZ_CREDENTIALS_FILE", "") or "").strip() or str(
-        (extra or {}).get("credentials_file", "") or ""
+        (extra or {}).get("credentials_file", "")
     ).strip()
+    if not configured and not _profile_scoped():
+        # Unscoped gate path (#98738 default profile under multiplex): the
+        # startup gate receives no PlatformConfig, so the profile's own
+        # config.yaml ``buzz.extra.credentials_file`` is the last place the
+        # file can be declared before failing closed. Under multiplex the
+        # glob below would cross profiles (#98738), but reading THIS
+        # profile's config is exactly the isolation the scoped path has.
+        extra_cfg = _read_profile_buzz_extra()
+        configured = str((extra_cfg or {}).get("credentials_file", "")).strip()
     if configured:
         return [Path(configured).expanduser()]
     if _is_multiplex_active():
@@ -841,15 +879,19 @@ class BuzzAdapter(BasePlatformAdapter):
         # id, "off" posts every reply as a normal top-level channel message.
         # Mirrors the Discord/Telegram adapters, which already honor this
         # PlatformConfig field; without it Buzz threaded unconditionally.
-        # Env (BUZZ_REPLY_TO_MODE) overrides config.yaml.
-        _rtm = (os.getenv("BUZZ_REPLY_TO_MODE") or getattr(config, "reply_to_mode", "first")
-                or "first")
+        # Env (BUZZ_REPLY_TO_MODE) overrides config.yaml; under a secondary
+        # multiplex profile scope env is not consulted (same rule as the
+        # other settings above) — reply_to_mode is a first-class
+        # PlatformConfig field, not an extra key, so it reads getattr(config)
+        # rather than going through _scoped_platform_setting.
+        _rtm_env = None if _profile_scoped() else os.getenv("BUZZ_REPLY_TO_MODE")
+        _rtm = (_rtm_env or getattr(config, "reply_to_mode", "first") or "first")
         self._reply_to_mode: str = str(_rtm).strip().lower()
         # Slack-convention alias: platforms.buzz.extra.reply_in_thread: false
         # (the key users already know from Slack) opts out of threading the
         # same way reply_to_mode: off does. Env (BUZZ_REPLY_IN_THREAD)
         # overrides config.yaml. See #95842 / #75082.
-        _rit_raw = os.getenv("BUZZ_REPLY_IN_THREAD")
+        _rit_raw = _scoped_platform_setting("BUZZ_REPLY_IN_THREAD", extra, "reply_in_thread")
         _rit = extra.get("reply_in_thread") if _rit_raw is None else _rit_raw
         if _rit is not None and str(_rit).strip().lower() in ("false", "0", "no", "off"):
             self._reply_to_mode = "off"
@@ -881,10 +923,15 @@ class BuzzAdapter(BasePlatformAdapter):
         # intact while providing receipt visibility for agent-authored notes.
         # If a pubkey appears in both sets, allowed_users takes precedence: the
         # normal authorized dispatch path runs and this reaction-only path does not.
-        raw_reaction_only = (
-            os.getenv("BUZZ_REACTION_ONLY_USERS")
-            or extra.get("reaction_only_users", [])
+        # Same multiplex-profile scoping as allowed_users above (#98738) — under
+        # a secondary profile scope env is not consulted, so a missing key
+        # falls back to this profile's own extra.reaction_only_users instead of
+        # silently borrowing the default profile's allowlist.
+        raw_reaction_only = _scoped_platform_setting(
+            "BUZZ_REACTION_ONLY_USERS", extra, "reaction_only_users"
         )
+        if raw_reaction_only is None:
+            raw_reaction_only = extra.get("reaction_only_users", [])
         if isinstance(raw_reaction_only, str):
             raw_reaction_only = raw_reaction_only.split(",")
         self._reaction_only_pubkeys: set = {
@@ -908,6 +955,10 @@ class BuzzAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
+        self._presence_task: Optional[asyncio.Task] = None
+        self._presence_interval = _PRESENCE_INTERVAL
+        self._presence_expiry = _PRESENCE_EXPIRY
+        self._presence_margin = _PRESENCE_REFRESH_MARGIN
         self._ws_active = False  # True while the WS loop owns inbound delivery
         self._membership_since = 0
         self._lock_key: Optional[str] = None
@@ -936,6 +987,36 @@ class BuzzAdapter(BasePlatformAdapter):
         # was itself top-level.  Lets send() mirror the user's own threading
         # instead of opening a new thread under every reply (see _thread_root).
         self._thread_roots: "OrderedDict[str, Optional[str]]" = OrderedDict()
+
+        # ── Reaction lifecycle (👀 received → 🧠 working → ✅/❌) ──────────
+        # Best-effort visible progress: Buzz has no typing-indicator API, so
+        # reactions are the only pre-reply surface. Config gate:
+        #   gateway.platforms.buzz.extra.reactions (default true)
+        # Deliberately NOT an env var — behavioral config belongs in
+        # config.yaml (profile-scoped, so multiplex profiles stay isolated).
+        reactions_raw = extra.get("reactions", True)
+        if isinstance(reactions_raw, bool):
+            self._reactions_enabled_flag = reactions_raw
+        else:
+            _text = str(reactions_raw).strip().lower()
+            if _text in ("true", "1", "yes", "on"):
+                self._reactions_enabled_flag = True
+            elif _text in ("false", "0", "no", "off"):
+                self._reactions_enabled_flag = False
+            else:
+                logger.warning(
+                    "Buzz: invalid reactions value %r in platforms.buzz.extra; "
+                    "using default true",
+                    reactions_raw,
+                )
+                self._reactions_enabled_flag = True
+        # (chat_id, message_id) -> {"emoji": str|None, "terminal": bool,
+        # "tail_task": asyncio.Task|None, "last_active": float}
+        self._reaction_lifecycle: Dict[tuple, dict] = {}
+        self._reaction_tasks: set = set()
+        self._reaction_cleanup_task: Optional[asyncio.Task] = None
+        self._reaction_cleanup_interval = _REACTION_CLEANUP_INTERVAL
+        self._reaction_cleanup_ttl = _REACTION_CLEANUP_TTL
 
     @property
     def name(self) -> str:
@@ -966,6 +1047,64 @@ class BuzzAdapter(BasePlatformAdapter):
             auth_tag=self._auth_tag,
             input_text=input_text,
         )
+
+    async def _set_presence(self, status: str) -> bool:
+        """Publish a best-effort presence state to the Buzz relay."""
+        try:
+            code, _out, err = await self._run_cli(
+                ["users", "set-presence", "--status", status]
+            )
+        except Exception as exc:
+            logger.debug("Buzz: presence update to %s failed — %s", status, exc)
+            return False
+        if code != 0:
+            logger.debug(
+                "Buzz: presence update to %s failed — %s",
+                status,
+                _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    async def _presence_loop(self) -> None:
+        """Refresh online presence until the adapter disconnects.
+
+        Each sleep uses the effective cadence — the configured interval
+        clamped by :func:`_presence_refresh_interval` — so every refresh
+        lands at least the margin before the relay's presence TTL lapses,
+        including the first refresh after the connect-time publish.
+        """
+        try:
+            while True:
+                await asyncio.sleep(
+                    _presence_refresh_interval(
+                        self._presence_interval,
+                        self._presence_expiry,
+                        self._presence_margin,
+                    )
+                )
+                await self._set_presence("online")
+        except asyncio.CancelledError:
+            raise
+
+    async def _start_presence(self) -> None:
+        """Publish online presence and start its expiry-refresh task."""
+        await self._set_presence("online")
+        self._presence_task = asyncio.create_task(self._presence_loop())
+
+    async def _stop_presence(self) -> None:
+        """Stop refreshing and publish offline presence best-effort."""
+        if self._presence_task and not self._presence_task.done():
+            self._presence_task.cancel()
+            await asyncio.gather(self._presence_task, return_exceptions=True)
+        self._presence_task = None
+        try:
+            await asyncio.wait_for(self._set_presence("offline"), timeout=5)
+        except Exception:
+            # Best-effort: never let presence block shutdown. (Timeouts are
+            # Exception subclasses on every supported Python, and
+            # CancelledError deliberately propagates.)
+            pass
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
@@ -1085,6 +1224,8 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
+        # Publish online presence and refresh it against relay expiry.
+        await self._start_presence()
         self._mark_connected()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
@@ -1125,8 +1266,264 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        # Presence: stop refreshing, then publish offline best-effort. A
+        # failed publish must not break shutdown (relay may already be gone).
+        await self._stop_presence()
+        # Reaction lifecycle: cancel any in-flight transition tasks so
+        # shutdown never leaks "task pending" warnings or hangs on a wedged
+        # buzz-cli call.
+        pending = [t for t in self._reaction_tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # Stop the abandoned-state sweeper before clearing its state: it only
+        # runs while entries exist and restarts on the next enqueue.
+        if self._reaction_cleanup_task and not self._reaction_cleanup_task.done():
+            self._reaction_cleanup_task.cancel()
+            try:
+                await self._reaction_cleanup_task
+            except asyncio.CancelledError:
+                pass
+        self._reaction_cleanup_task = None
+        self._reaction_tasks.clear()
+        self._reaction_lifecycle = {}
         self._channel_state = {}
         self._poll_count = 0
+
+    async def remove_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Remove our emoji reaction from a message via buzz-cli.
+
+        Mirrors :meth:`send_reaction`: best-effort, returns True/False, never
+        raises into the message flow. Requires the exact emoji because the
+        CLI contract is ``reactions remove --event <id> --emoji <e>``.
+        """
+        if not self.cli_path or not emoji or not message_id:
+            return False
+        args = [
+            "reactions", "remove",
+            "--event", str(message_id),
+            "--emoji", emoji,
+        ]
+        try:
+            code, _out, err = await self._run_cli(args)
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
+        if code != 0:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    # ── Reaction lifecycle coordinator ────────────────────────────────────
+    #
+    # Buzz has no typing-indicator API, so reactions are the only visible
+    # pre-reply progress. State machine per inbound message, keyed
+    # (chat_id, message_id): 👀 queued at dispatch → 🧠 when background
+    # processing starts → ✅/❌ on the real outcome (CANCELLED removes the
+    # working reaction and adds nothing). Transitions are serialized per
+    # message behind a tail task so hooks can fire out of order / early
+    # without stacking or racing reactions on the relay, and every buzz-cli
+    # call happens in a background task — never awaited by message
+    # processing or response delivery. Best-effort throughout: any failure
+    # only means the user sees a stale emoji, never a broken reply.
+    #
+    # Abandoned-state cleanup: the terminal hook is the only normal way an
+    # entry leaves ``_reaction_lifecycle``, so a hung/hard-crashed turn
+    # would otherwise pin its entry until disconnect. A single shared
+    # sweeper task (started lazily with the first entry, self-terminating
+    # when the map empties — never one task per message) drops entries idle
+    # past ``_REACTION_CLEANUP_TTL`` and cancels wedged transitions at the
+    # same bound; sweeps never touch a valid in-flight transition younger
+    # than the TTL.
+
+    _RECEIVED_EMOJI = "\N{EYES}"
+    _WORKING_EMOJI = "\N{BRAIN}"
+    _OK_EMOJI = "\N{WHITE HEAVY CHECK MARK}"
+    _FAIL_EMOJI = "\N{CROSS MARK}"
+
+    def _reactions_enabled(self) -> bool:
+        """Config gate: platforms.buzz.extra.reactions (default true)."""
+        return self._reactions_enabled_flag
+
+    def _reaction_begin(self, chat_id: str, message_id: str) -> None:
+        """Create lifecycle state and queue the 👀 transition (non-blocking)."""
+        key = (chat_id, message_id)
+        if key in self._reaction_lifecycle:
+            return
+        self._reaction_lifecycle[key] = {
+            "emoji": None, "terminal": False, "tail_task": None,
+            "last_active": time.monotonic(),
+        }
+        self._reaction_transition_enqueue(key, self._RECEIVED_EMOJI)
+        self._ensure_reaction_cleanup()
+
+    def _ensure_reaction_cleanup(self) -> None:
+        """Run the abandoned-state sweeper while any lifecycle entry exists.
+
+        One shared task, (re)started lazily when state is created and ending
+        itself when the map empties — never one background task per message.
+        """
+        if self._reaction_cleanup_task is None or self._reaction_cleanup_task.done():
+            self._reaction_cleanup_task = asyncio.ensure_future(
+                self._reaction_cleanup_loop()
+            )
+
+    async def _reaction_cleanup_loop(self) -> None:
+        """Drop lifecycle entries whose terminal hook never arrives."""
+        try:
+            while self._reaction_lifecycle:
+                await asyncio.sleep(self._reaction_cleanup_interval)
+                await self._reaction_cleanup_once()
+        except asyncio.CancelledError:
+            raise
+
+    async def _reaction_cleanup_once(self) -> None:
+        """One sweep: expire idle entries; time out wedged transitions.
+
+        An entry is idle when its transition chain has been quiescent for
+        ``_reaction_cleanup_ttl`` — the tail task is done AND no new activity
+        happened within the TTL. A wedged (never-completing) transition is
+        cancelled at the TTL and its entry dropped: the tail's ``finally``
+        only pops terminal entries, so cleanup must drop non-terminal state
+        itself, and cancelling the tail stops the chain head from enqueuing
+        more work (each successor re-raises when its predecessor is
+        cancelled). Older links still draining a slow buzz-cli call finish
+        on their own ``_CLI_TIMEOUT`` and find the state gone. In-flight
+        work younger than the TTL is never touched.
+        """
+        now = time.monotonic()
+        stale: List[tuple] = []
+        for key, state in self._reaction_lifecycle.items():
+            tail = state.get("tail_task")
+            if now - state.get("last_active", 0) >= self._reaction_cleanup_ttl:
+                if tail is not None and not tail.done():
+                    tail.cancel()
+                stale.append(key)
+        for key in stale:
+            self._reaction_lifecycle.pop(key, None)
+
+    def _reaction_transition_enqueue(
+        self, key: tuple, desired: Optional[str], *, terminal: bool = False
+    ) -> None:
+        """Queue a transition behind the current tail; returns immediately.
+
+        ``terminal=True`` marks the lifecycle finished. The transition still
+        runs (chained behind its predecessors), but no further transitions
+        may be enqueued and the terminal task drops the lifecycle state when
+        it completes.
+        """
+        state = self._reaction_lifecycle.get(key)
+        if state is None or state["terminal"]:
+            return
+        if terminal:
+            state["terminal"] = True
+        state["last_active"] = time.monotonic()
+        task = asyncio.create_task(
+            self._reaction_transition_run(
+                key, desired, state.get("tail_task"), terminal
+            )
+        )
+        state["tail_task"] = task
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _reaction_transition_run(
+        self,
+        key: tuple,
+        desired: Optional[str],
+        prev: Optional[asyncio.Task],
+        terminal: bool,
+    ) -> None:
+        """Serialized remove-gated replacement; see block comment above."""
+        try:
+            if prev is not None:
+                try:
+                    await prev
+                except asyncio.CancelledError:
+                    # Shutdown cancelled the chain ahead of us — stop here.
+                    raise
+                except Exception:
+                    pass  # predecessor failed; best-effort chain continues
+            state = self._reaction_lifecycle.get(key)
+            if state is None:
+                return
+            chat_id, message_id = key
+            current = state["emoji"]
+            if desired != current:
+                if current is not None:
+                    if not await self.remove_reaction(chat_id, message_id, current):
+                        # Keep the old reaction authoritative; skip the add
+                        # so two lifecycle reactions never stack on the relay.
+                        return
+                    state["emoji"] = None
+                if desired is not None and await self.send_reaction(
+                    chat_id, message_id, desired
+                ):
+                    state["emoji"] = desired
+        finally:
+            if terminal:
+                # The terminal task is the chain's last link (later enqueues
+                # are rejected), so dropping the state here cannot orphan a
+                # queued transition. Best-effort end regardless of I/O result.
+                self._reaction_lifecycle.pop(key, None)
+
+    def _reaction_eligible(self, event: MessageEvent) -> bool:
+        """True when this turn should carry lifecycle reactions.
+
+        Requires message ids, an enabled gate, a conversational (non-command)
+        message, and — when a gateway authorization callback is installed —
+        a positive authorization for the sender. ``on_processing_start`` runs
+        before the runner's central authorization check, so without this
+        gate unauthorized senders would earn a 👀 they can see.
+        """
+        if not getattr(event, "message_id", None):
+            return False
+        if not self._reactions_enabled():
+            return False
+        if not isinstance(getattr(event, "text", None), str) or event.is_command():
+            return False
+        if self._authorization_check is None:
+            return True
+        decision = self._is_sender_authorized(
+            getattr(event.source, "user_id", None),
+            chat_type=getattr(event.source, "chat_type", None),
+            chat_id=getattr(event.source, "chat_id", None),
+        )
+        return decision is True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """👀 → 🧠 when background processing of the message begins."""
+        key = (
+            getattr(event.source, "chat_id", None),
+            getattr(event, "message_id", None),
+        )
+        if key in self._reaction_lifecycle:
+            self._reaction_transition_enqueue(key, self._WORKING_EMOJI)
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """🧠 → ✅/❌ on the real outcome; CANCELLED removes and adds nothing."""
+        key = (
+            getattr(event.source, "chat_id", None),
+            getattr(event, "message_id", None),
+        )
+        if key not in self._reaction_lifecycle:
+            return
+        if outcome == ProcessingOutcome.SUCCESS:
+            desired = self._OK_EMOJI
+        elif outcome == ProcessingOutcome.FAILURE:
+            desired = self._FAIL_EMOJI
+        else:
+            desired = None  # CANCELLED: remove current, add no terminal.
+        self._reaction_transition_enqueue(key, desired, terminal=True)
 
     # ── Sending ───────────────────────────────────────────────────────────
 
@@ -1401,7 +1798,14 @@ class BuzzAdapter(BasePlatformAdapter):
             "--event", str(message_id),
             "--emoji", emoji,
         ]
-        code, _out, err = await self._run_cli(args)
+        try:
+            code, _out, err = await self._run_cli(args)
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction add failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
         if code != 0:
             logger.debug(
                 "Buzz: reaction add failed for message %s in %s — %s",
@@ -1873,6 +2277,71 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("Buzz: WebSocket discovery sweep failed", exc_info=True)
 
+    async def _probe_liveness(self, websocket) -> None:
+        """Demand proof of transport life via a ping/pong round-trip.
+
+        Pings the *connection object* — in websockets 15.x ``ping()`` lives on
+        ``ClientConnection``; ``__aiter__()`` yields a distinct async generator
+        with no ping surface, so probing the iterator would silently send
+        nothing. Awaiting ``ping()`` sends the ping and returns a pong waiter,
+        which is awaited here. In the #98097 shape (socket parked in
+        CLOSE_WAIT), the send succeeds into the kernel buffer but the waiter
+        never completes, so the caller's timeout fires. Test doubles without
+        a ping surface return immediately: their liveness is their ``recv()``
+        behavior. Transport errors (ConnectionClosed) propagate to the
+        reconnect path.
+        """
+        ping_fn = getattr(websocket, "ping", None)
+        if not callable(ping_fn):
+            return
+        pong_waiter = await cast("Awaitable[Any]", ping_fn())
+        if pong_waiter is not None:
+            await pong_waiter
+
+    async def _read_frame_or_probe(self, frame_iter, websocket) -> str:
+        """Await the next frame, probing transport liveness while quiet.
+
+        Race the raw frame read against a periodic ping round-trip. When a
+        frame arrives first it is returned untouched. When the frame read has
+        been quiet for ``_WS_LIVENESS_INTERVAL`` seconds, send a ping that the
+        relay must answer within ``_WS_LIVENESS_TIMEOUT``: an answer proves the
+        transport is alive and the read keeps waiting (a quiet relay is not a
+        dead relay); no answer means the connection went silent (#98097) and
+        this raises ``ConnectionError`` into the reconnect path. Any error from
+        the transport itself propagates unchanged.
+        """
+        read_task = asyncio.ensure_future(frame_iter.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {read_task},
+                    timeout=_WS_LIVENESS_INTERVAL,
+                )
+                if done:
+                    return read_task.result()
+                # Quiet for one interval: demand proof of life.
+                try:
+                    await asyncio.wait_for(
+                        self._probe_liveness(websocket),
+                        timeout=_WS_LIVENESS_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    raise ConnectionError(
+                        "relay did not answer a liveness ping within "
+                        f"{_WS_LIVENESS_TIMEOUT:.0f}s; assuming the "
+                        "connection went silent"
+                    ) from None
+                # Alive but quiet: keep waiting for the next frame.
+        finally:
+            # Cancel is a no-op on a completed task; awaiting retrieves the
+            # outcome either way so a completed-with-exception recv can't
+            # surface as "exception was never retrieved" noise.
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
         backoff. Events route through _handle_event() — identical semantics
@@ -1908,18 +2377,17 @@ class BuzzAdapter(BasePlatformAdapter):
                         try:
                             frame_iter = websocket.__aiter__()
                             while True:
-                                try:
-                                    raw = await asyncio.wait_for(
-                                        frame_iter.__anext__(),
-                                        timeout=_WS_READ_IDLE_TIMEOUT,
-                                    )
-                                except StopAsyncIteration:
-                                    break
-                                except asyncio.TimeoutError:
-                                    raise ConnectionError(
-                                        f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; "
-                                        "assuming the connection went silent"
-                                    ) from None
+                                # Wait for the next frame while probing
+                                # transport liveness. A silent relay is not
+                                # necessarily dead (#98097's CLOSE_WAIT
+                                # shape vs. a simply quiet night), so the
+                                # probe is a ping round-trip the relay must
+                                # answer within _WS_LIVENESS_TIMEOUT; an
+                                # unanswered probe — or any transport error
+                                # — raises into the reconnect path.
+                                raw = await self._read_frame_or_probe(
+                                    frame_iter, websocket
+                                )
                                 try:
                                     message = json.loads(raw)
                                 except (ValueError, TypeError):
@@ -2997,6 +3465,11 @@ class BuzzAdapter(BasePlatformAdapter):
             thread_id=thread_id,
         )
 
+        # Reaction lifecycle: create state and queue 👀 as a tracked
+        # transition BEFORE handle_message (which spawns the background task
+        # that fires on_processing_start) so the states stay ordered.
+        # Skipped for commands / disabled gate / unauthorized senders / bad
+        # ids — see _reaction_eligible.
         event = MessageEvent(
             text=text,
             message_type=message_type,
@@ -3013,14 +3486,10 @@ class BuzzAdapter(BasePlatformAdapter):
             reply_to_is_own_message=reply_to_is_own_message,
         )
 
-        await self.handle_message(event)
+        if self._reaction_eligible(event):
+            self._reaction_begin(chat_id, message_id)
 
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+        await self.handle_message(event)
 
 
 # ---------------------------------------------------------------------------
@@ -3038,6 +3507,44 @@ def _profile_buzz_extra() -> dict:
     """
     if not _profile_scoped():
         return {}
+    return _read_profile_buzz_extra()
+
+
+def _read_profile_buzz_extra() -> dict:
+    """Read the effective ``buzz.extra`` from the active hermes home's config.yaml.
+
+    Shared by the scoped gate (secondary multiplex profiles, where the
+    hermes-home override points at that profile's home) and the unscoped
+    default-profile gate: ``check_requirements()`` receives no
+    ``PlatformConfig``, so a ``credentials_file`` or ``relay_url`` declared
+    only in config.yaml is otherwise invisible to it. Best-effort — any
+    failure yields an empty mapping and the caller fails closed.
+
+    Mirrors what the unscoped loader produces at runtime, per key kind:
+
+    * Nested blocks (``gateway.platforms.buzz``, ``platforms.buzz``,
+      ``gateway.buzz``) merge through their ``extra:`` sub-keys in loader
+      order — gateway.platforms first, platforms overlays it, gateway.buzz
+      overlays last. Bare (non-``extra``) keys in nested blocks never
+      become runtime extra.
+    * Bridged keys (``_BRIDGED_EXTRA_KEYS``) additionally resolve through
+      the ONE block the loader dispatches ``_apply_yaml_config`` on —
+      top-level ``buzz:`` when present, else ``gateway.platforms.buzz``,
+      else ``platforms.buzz`` — but only truthy values: the bridge writes
+      env first-writer-wins and skips empties, and env beats extra at the
+      adapter. So an empty-string override never clears a bridged value,
+      and the top-level block's truthy bridged keys win outright.
+    * Non-bridged keys (``credentials_file`` is never bridged) keep
+      gap-fill semantics from the top-level block: the bridge never
+      exports them, so runtime sees them only through this helper's
+      last-resort rung in ``_credentials_candidates``.
+    * Under a secondary-profile scope the bridge is disabled and the
+      top-level block never reaches ``PlatformConfig.extra`` (#98738):
+      nested ``extra:`` sub-keys only.
+
+    Earlier shapes (first-match at f0bf5f79, plain nested-merge at
+    dc5860ca) made the gate disagree with the loader on composed configs.
+    """
     try:
         from hermes_constants import get_hermes_home
         from hermes_cli.config import read_user_config_raw
@@ -3047,11 +3554,52 @@ def _profile_buzz_extra() -> dict:
         return {}
     if not isinstance(cfg, dict):
         return {}
-    buzz = ((cfg.get("gateway") or {}).get("platforms") or {}).get("buzz")
-    if not isinstance(buzz, dict):
-        return {}
-    extra = buzz.get("extra", buzz)
-    return extra if isinstance(extra, dict) else {}
+
+    def _section(source, key) -> dict:
+        if not isinstance(source, dict):
+            return {}
+        value = source.get(key)
+        return value if isinstance(value, dict) else {}
+
+    def _extra_of(block) -> dict:
+        # Extra-or-bare, mirroring ``_apply_yaml_config``'s view of the
+        # block it is dispatched on.
+        extra = block.get("extra", block)
+        return extra if isinstance(extra, dict) else {}
+
+    def _extra_only(block) -> dict:
+        # Nested blocks contribute ONLY their ``extra:`` sub-key to the
+        # runtime merge (gateway/config.py ``_merge_platform_map`` merges
+        # ``plat_block.get("extra", {})``); bare keys are dropped.
+        extra = block.get("extra")
+        return extra if isinstance(extra, dict) else {}
+
+    gateway_cfg = _section(cfg, "gateway")
+    gw_platforms_block = _section(_section(gateway_cfg, "platforms"), "buzz")
+    platforms_block = _section(_section(cfg, "platforms"), "buzz")
+
+    merged: dict = {}
+    for block in (gw_platforms_block, platforms_block, _section(gateway_cfg, "buzz")):
+        merged.update(_extra_only(block))
+
+    top_block = _section(cfg, "buzz")
+    if _profile_scoped():
+        # Secondary profile scope: no env bridge, and top-level ``buzz:``
+        # never lands in PlatformConfig.extra — it is inert here.
+        return merged
+
+    # Unscoped: bridged keys resolve through the ONE bridge block, truthy
+    # values only, overriding the nested merge (env beats extra).
+    bridge_block = top_block or gw_platforms_block or platforms_block
+    bridge_extra = _extra_of(bridge_block)
+    for key in _BRIDGED_EXTRA_KEYS:
+        value = bridge_extra.get(key)
+        if value:
+            merged[key] = value
+    # Non-bridged keys from the top-level block only fill gaps.
+    for key, value in _extra_of(top_block).items():
+        merged.setdefault(key, value)
+    return merged
 
 
 def check_requirements() -> bool:
@@ -3068,7 +3616,14 @@ def check_requirements() -> bool:
     # Scope-aware read: the gate runs before per-profile scopes install, and
     # BUZZ_RELAY_URL can be externally managed just like the key (#95216).
     if not (_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip():
-        return False
+        # The gate runs before load_gateway_config's YAML→env bridge, but the
+        # bridge seeds BUZZ_RELAY_URL wherever env is unset — so a relay
+        # declared only in config.yaml is effective at runtime and must not
+        # fail the gate here. Consult the same merged config view the key
+        # fallback uses; fail closed when neither place has a relay.
+        relay_cfg = str(_read_profile_buzz_extra().get("relay_url", "")).strip()
+        if not relay_cfg:
+            return False
     return bool(_resolve_private_key())
 
 
@@ -3089,6 +3644,25 @@ def validate_config(config) -> bool:
 def is_connected(config) -> bool:
     """Check whether Buzz is configured (env or config.yaml)."""
     return validate_config(config)
+
+
+# Keys ``_apply_yaml_config`` bridges into ``BUZZ_*`` env vars. The gate's
+# config view must resolve these through the bridge block order, matching
+# runtime where env (the bridge's output) beats extra.
+_BRIDGED_EXTRA_KEYS = (
+    "relay_url",
+    "cli_path",
+    "home_channel",
+    "transport",
+    "poll_interval",
+    "channels",
+    "allowed_users",
+    "reaction_only_users",
+    "allow_all_users",
+    "require_mention",
+    "reply_in_thread",
+    "reply_to_mode",
+)
 
 
 def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
@@ -3145,9 +3719,9 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not _skip_env_bridge and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
-    if "reply_in_thread" in extra and not os.getenv("BUZZ_REPLY_IN_THREAD"):
+    if "reply_in_thread" in extra and not _skip_env_bridge and not os.getenv("BUZZ_REPLY_IN_THREAD"):
         os.environ["BUZZ_REPLY_IN_THREAD"] = str(extra["reply_in_thread"]).lower()
-    if "reply_to_mode" in extra and not os.getenv("BUZZ_REPLY_TO_MODE"):
+    if "reply_to_mode" in extra and not _skip_env_bridge and not os.getenv("BUZZ_REPLY_TO_MODE"):
         os.environ["BUZZ_REPLY_TO_MODE"] = str(extra["reply_to_mode"]).lower()
     return None
 
@@ -3232,13 +3806,14 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    # Same reply_to_mode / reply_in_thread gate as the live adapter, so
-    # out-of-process cron delivery (deliver=buzz) doesn't thread when the
-    # operator asked for flat channel replies.
-    _rtm = (os.getenv("BUZZ_REPLY_TO_MODE")
-            or getattr(pconfig, "reply_to_mode", "first") or "first")
+    # Same reply_to_mode / reply_in_thread gate as the live adapter (and the
+    # same multiplex-profile scoping, #98738 -- env is not consulted inside a
+    # secondary profile scope), so out-of-process cron delivery (deliver=buzz)
+    # doesn't thread when the operator asked for flat channel replies.
+    _rtm_env = None if _profile_scoped() else os.getenv("BUZZ_REPLY_TO_MODE")
+    _rtm = (_rtm_env or getattr(pconfig, "reply_to_mode", "first") or "first")
     _rtm = str(_rtm).strip().lower()
-    _rit = os.getenv("BUZZ_REPLY_IN_THREAD")
+    _rit = _scoped_platform_setting("BUZZ_REPLY_IN_THREAD", extra, "reply_in_thread")
     if _rit is None:
         _rit = extra.get("reply_in_thread")
     if _rit is not None and str(_rit).strip().lower() in ("false", "0", "no", "off"):

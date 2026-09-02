@@ -85,6 +85,7 @@ gateway:
         allowed_users: []                 # empty = allow all if allow_all_users is true; otherwise restrict to listed npubs/hex pubkeys
         require_mention: true             # in channels: only respond when addressed (@name, npub, or hex pubkey); DMs always dispatch regardless
         allow_all_users: false            # set true for community mode (everyone can chat, only owner is admin); false for private mode (only allowed_users)
+        reactions: true                   # 👀 received → 🧠 working → ✅/❌ done reactions on each conversational turn
 ```
 
 **Why these defaults:**
@@ -105,6 +106,7 @@ gateway:
 - Direct messages always reach the agent, no mention needed.
 - The agent's own messages are never dispatched back to it (self-echo suppression by pubkey), and every event is de-duplicated by event id against a per-channel high-water mark.
 
+
 ## Reply threading
 
 Replies are threaded by default: the agent's answer (and any enabled progress/status messages) is anchored to the message that triggered it. Anchoring is NIP-10 aware — when the triggering message was already **inside** a thread, the agent replies to that thread's *root*, so the answer joins the existing thread instead of nesting a new one-message sub-thread under every turn.
@@ -121,6 +123,24 @@ gateway:
 ```
 
 The opt-out applies to **all** send paths — final answers, streamed updates, interim commentary, tool-progress bubbles, and out-of-process cron delivery (`deliver=buzz`).
+
+
+## Reaction lifecycle
+
+Buzz has no typing indicator, so the agent marks each conversational turn with emoji reactions on your message:
+
+- 👀 — received
+- 🧠 — working on it
+- ✅ — replied successfully
+- ❌ — failed (the error follows as a regular message)
+
+Only one reaction is shown at a time — each replaces the previous one. Commands (`/status`, `/stop`, …) don't get reactions, and senders who aren't authorized to talk to the agent never see any. Reactions are best-effort: if a reaction fails to update, the reply is unaffected. Set `reactions: false` in the `buzz` `extra` block to turn them off.
+
+If a reply never finishes (the agent crashes or processing hangs), the working reaction could otherwise stay on the message until restart. A periodic sweep retires these abandoned lifecycle reactions a few minutes after the last activity, and a wedged update is cancelled at the same bound — a slow relay that resumes after that simply finds nothing left to update. Normal replies always finish their ✅/❌ first; the sweep only catches turns whose terminal state never arrived.
+
+## Presence
+
+Buzz relays expire presence records after about 3 minutes unless they are republished. The adapter publishes `online` when it connects, refreshes it every minute — comfortably inside that expiry window — and publishes `offline` on graceful shutdown (best-effort: a slow or unreachable relay never blocks startup or shutdown).
 
 ## Access control
 

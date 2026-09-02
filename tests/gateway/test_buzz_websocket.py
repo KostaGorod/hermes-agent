@@ -116,10 +116,12 @@ class _ScriptedWebSocket(_FakeWebSocket):
     a clean close.
     """
 
-    def __init__(self, anext_behavior):
+    def __init__(self, anext_behavior, ping_behavior=None):
         super().__init__()
         self._anext_behavior = anext_behavior
+        self._ping_behavior = ping_behavior
         self.exited = False
+        self.ping_count = 0
 
     async def __aenter__(self):
         return self
@@ -128,24 +130,89 @@ class _ScriptedWebSocket(_FakeWebSocket):
         self.exited = True
 
     def __aiter__(self):
+        # Production shape (websockets 15.x): __aiter__() returns a distinct
+        # async iterator that does NOT expose ping()/pong() — the connection
+        # object does. Tests must not conflate the two, or a probe that pings
+        # the iterator instead of the connection passes while production
+        # never pings at all.
+        return _ScriptedFrameIterator(self._anext_behavior)
+
+    async def ping(self):
+        self.ping_count += 1
+        if self._ping_behavior is None:
+            return None
+        return await self._ping_behavior()
+
+
+class _ScriptedFrameIterator:
+    """Async iterator over scripted frames — the production iterator shape."""
+
+    def __init__(self, anext_behavior):
+        self._anext_behavior = anext_behavior
+
+    def __aiter__(self):
         return self
 
     async def __anext__(self):
         return await self._anext_behavior()
 
 
+async def _resolved_pong():
+    waiter = asyncio.get_running_loop().create_future()
+    waiter.set_result(0.0)
+    return waiter
+
+
+async def _unresolved_pong():
+    return asyncio.get_running_loop().create_future()
+
+
 @pytest.mark.asyncio
-async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, caplog):
+async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
+    """A quiet relay that answers ping/pong must not be reconnected."""
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.02)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 0.02)
+
+    sockets = []
+
+    async def quiet_anext():
+        await asyncio.Event().wait()  # no application frames
+
+    def fake_connect(*args, **kwargs):
+        ws = _ScriptedWebSocket(quiet_anext, _resolved_pong)
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    # Auth handshake consumes a couple of ticks; leave room for ≥2 probes.
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5.0)
+
+    assert len(sockets) == 1
+    assert sockets[0].ping_count >= 2
+    assert sockets[0].exited
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_reconnects_when_liveness_ping_goes_silent(monkeypatch, caplog):
     """A relay close the transport never surfaces must not park the loop.
 
     Reproduces the #98097 shape: a socket stuck in CLOSE_WAIT yields no
-    frame and no error, so without a read-side bound the loop would wait
-    forever while the gateway keeps reporting "connected".
+    frame and no error, so the read-side liveness ping must force the normal
+    reconnect path rather than leaving the gateway reporting "connected".
     """
     import logging
 
     adapter = _make_adapter()
-    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.02)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 0.02)
     caplog.set_level(logging.WARNING)
 
     sockets = []
@@ -154,7 +221,7 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
         await asyncio.Event().wait()  # never yields, never raises
 
     def fake_connect(*args, **kwargs):
-        ws = _ScriptedWebSocket(dead_anext)
+        ws = _ScriptedWebSocket(dead_anext, _unresolved_pong)
         sockets.append(ws)
         return ws
 
@@ -174,7 +241,7 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
-    assert len(sockets) >= 2, "idle read watchdog did not force a reconnect"
+    assert len(sockets) >= 2, "liveness probe did not force a reconnect"
     assert sockets[0].exited, "the silent connection was not closed before reconnecting"
     assert any("went silent" in record.message for record in caplog.records)
 
