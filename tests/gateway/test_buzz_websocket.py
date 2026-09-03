@@ -267,7 +267,14 @@ async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
 
     monkeypatch.setattr(_ws_mod, "connect", fake_connect)
     task = asyncio.create_task(adapter._websocket_loop())
-    await asyncio.sleep(0.2)
+    # Event-driven wait for two liveness probes on the quiet connection: a
+    # fixed sleep window assumes a quiet runner, but the connect path signs
+    # the AUTH event (and presence publish) in the executor before the read
+    # loop starts — under parallel load that can consume a fixed window and
+    # starve the probe count.
+    deadline = time.monotonic() + 5.0
+    while (not sockets or sockets[0].ping_count < 2) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5.0)
