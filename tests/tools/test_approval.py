@@ -1821,6 +1821,30 @@ class TestApprovalPromptRedaction:
         "https://api.openai.com/v1/models"
     )
 
+    def test_callback_is_force_redacted_when_global_redaction_is_disabled(
+        self, monkeypatch
+    ):
+        import agent.redact as redact
+
+        secret = "ghp_" + "X" * 36
+        captured = {}
+
+        def callback(command, description, **kwargs):
+            captured.update(command=command, description=description)
+            return "deny"
+
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+        result = prompt_dangerous_approval(
+            f"curl -H 'Authorization: token {secret}' https://api.github.com",
+            f"command carrying {secret}",
+            approval_callback=callback,
+        )
+
+        assert result == "deny"
+        assert secret not in captured["command"]
+        assert secret not in captured["description"]
+        assert "github.com" in captured["command"]
+
     def test_callback_receives_redacted_command(self):
         """prompt_dangerous_approval hands the callback a masked command."""
         seen = {}
