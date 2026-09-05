@@ -174,13 +174,30 @@ async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
     monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.02)
     monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 0.02)
 
+    async def no_presence(_websocket, _status):
+        return None
+
+    # Presence signing runs in the shared executor and is unrelated to this
+    # transport-liveness contract.  Under parallel test load it can consume
+    # most of a wall-clock polling budget before the read loop starts.
+    monkeypatch.setattr(adapter, "_publish_presence", no_presence)
+
     sockets = []
+    second_probe = asyncio.Event()
+    probe_count = 0
 
     async def quiet_anext():
         await asyncio.Event().wait()  # no application frames
 
+    async def record_resolved_pong():
+        nonlocal probe_count
+        probe_count += 1
+        if probe_count >= 2:
+            second_probe.set()
+        return await _resolved_pong()
+
     def fake_connect(*args, **kwargs):
-        ws = _ScriptedWebSocket(quiet_anext, _resolved_pong)
+        ws = _ScriptedWebSocket(quiet_anext, record_resolved_pong)
         sockets.append(ws)
         return ws
 
@@ -189,14 +206,14 @@ async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
     monkeypatch.setattr(_ws_mod, "connect", fake_connect)
 
     task = asyncio.create_task(adapter._websocket_loop())
-    # Wait for the observable contract instead of assuming a fixed number of
-    # event-loop turns; this file also runs under a heavily parallel wrapper.
-    deadline = time.monotonic() + 5.0
-    while (not sockets or sockets[0].ping_count < 2) and time.monotonic() < deadline:
-        await asyncio.sleep(0.02)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 5.0)
+    try:
+        # Wait on the exact two-probe evidence rather than sampling a counter
+        # at the edge of a shared wall-clock deadline.
+        await asyncio.wait_for(second_probe.wait(), 5.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5.0)
 
     assert len(sockets) == 1
     assert sockets[0].ping_count >= 2
