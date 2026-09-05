@@ -47,10 +47,10 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
         payload["preview"] = (
             f"{kind} {payload['mode']} to {', '.join(unique_targets)}\n"
             f"size: {len(new_value)} chars; sha256: {hashlib.sha256(new_value.encode()).hexdigest()}\n"
-            f"lines: +{new_value.count(chr(10)) + (1 if new_value else 0)}"
+            f"lines: +{len(new_value.splitlines())}"
         )
         if old_content is not None:
-            removed = old_content.count(chr(10)) + (1 if old_content else 0)
+            removed = len(old_content.splitlines())
             payload["preview"] += f" / -{removed}"
         payload["preview_truncated"] = True
     payload["display"] = (
