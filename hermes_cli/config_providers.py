@@ -308,6 +308,52 @@ def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, An
     return custom_providers
 
 
+def upsert_custom_provider_to_providers_dict(
+    cfg: Dict[str, Any], *, name: str, base_url: str, api_key: str = "",
+    key_env: str = "", model: str = "", context_length: Optional[int] = None,
+    api_mode: str = "",
+) -> Tuple[bool, str]:
+    """Upsert a custom endpoint in the keyed providers config shape."""
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        cfg["providers"] = providers
+    norm = str(base_url or "").strip().rstrip("/").lower()
+    key = next((k for k, entry in providers.items()
+                if isinstance(entry, dict) and str(entry.get("api", "")).strip().rstrip("/").lower() == norm), None)
+    if key is None:
+        key = str(name or "").strip().lower().replace(" ", "-").replace("(", "").replace(")", "")
+        key = re.sub(r"-{2,}", "-", key).strip("-")
+        if not key:
+            key = (urlparse(str(base_url or "")).hostname or "endpoint").replace(".", "-")
+        base = key
+        n = 0
+        while key in providers:
+            key = f"{base}-{n}"
+            n += 1
+    entry = providers.get(key) if isinstance(providers.get(key), dict) else {}
+    changed = False
+    for field, value in (("name", name), ("api", base_url), ("key_env", key_env),
+                         ("default_model", model), ("transport", api_mode), ("context_length", context_length)):
+        if value not in (None, "") and entry.get(field) != value:
+            entry[field] = value
+            changed = True
+    if key_env and entry.pop("api_key", None) is not None:
+        changed = True
+    elif not key_env and api_key and entry.get("api_key") != api_key:
+        entry["api_key"] = api_key
+        changed = True
+    if model and context_length:
+        models = entry.setdefault("models", {})
+        if models.get(model) != {"context_length": context_length}:
+            models[model] = {"context_length": context_length}
+            changed = True
+    if changed or key not in providers:
+        providers[key] = entry
+        changed = True
+    return changed, str(key)
+
+
 def get_compatible_custom_providers(
     config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Deduplicated list view over legacy ``custom_providers`` and v12+ ``providers``.

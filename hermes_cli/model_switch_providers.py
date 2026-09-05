@@ -36,16 +36,20 @@ def _save_discovered_models_to_config(
     try:
         from hermes_cli.config import load_config, save_config
         cfg = load_config()
-        providers = cfg.get("custom_providers") or []
-        if not isinstance(providers, list):
-            return
+        providers = []
+        keyed = cfg.get("providers")
+        if isinstance(keyed, dict):
+            providers.extend(entry for entry in keyed.values() if isinstance(entry, dict))
+        legacy = cfg.get("custom_providers")
+        if isinstance(legacy, list):
+            providers.extend(entry for entry in legacy if isinstance(entry, dict))
 
         norm_url = api_url.strip().rstrip("/").lower()
         changed = False
         for entry in providers:
             if not isinstance(entry, dict):
                 continue
-            entry_url = (entry.get("base_url", "") or entry.get("url", "")).strip()
+            entry_url = (entry.get("base_url", "") or entry.get("url", "") or entry.get("api", "")).strip()
             if entry_url.rstrip("/").lower() != norm_url or _entry_api_mode(entry) != api_mode:
                 continue
             if headers is not None and _extra_headers_from_config(entry) != headers:
@@ -57,7 +61,6 @@ def _save_discovered_models_to_config(
             changed = True
 
         if changed:
-            cfg["custom_providers"] = providers
             save_config(cfg)
     except Exception:
         pass

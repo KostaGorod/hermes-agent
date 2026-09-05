@@ -426,68 +426,33 @@ def _custom_provider_base_url_config_value(provider_info, resolved_base_url=""):
 
 def _save_custom_provider(base_url, api_key="", model="", context_length=None, name=None, api_mode=None,
                           key_env=""):
-    """Save a custom endpoint to ``custom_providers`` in config.yaml, deduplicated by base_url (an
-    existing entry gets model / context_length / api_mode updated). *key_env* set means the caller
-    already wrote the key to ``.env``; the entry references it instead of inlining the secret.
-
-    See #69449.
-    """
-    from hermes_cli.config import load_config, save_config
+    """Save a custom endpoint to the keyed ``providers`` config section."""
+    from hermes_cli.config import load_config, save_config, upsert_custom_provider_to_providers_dict
     cfg = load_config()
-    providers = cfg.get("custom_providers") or []
-    if not isinstance(providers, list):
-        providers = []
-    for entry in providers:
-        if not (isinstance(entry, dict) and entry.get("base_url", "").rstrip("/") == base_url.rstrip("/")):
-            continue
-        changed = False
-        if model and entry.get("model") != model:
-            entry["model"] = model
-            changed = True
-        if model and context_length:
-            _ensure_dict_section(entry, "models")[model] = {"context_length": context_length}
-            changed = True
-        if api_mode:
-            if entry.get("api_mode") != api_mode:
-                entry["api_mode"] = api_mode
-                changed = True
-        elif "api_mode" in entry:
-            entry.pop("api_mode", None)
-            changed = True
-        if key_env and (entry.get("key_env") != key_env or entry.get("api_key")):
-            entry["key_env"] = key_env
-            entry.pop("api_key", None)
-            changed = True
-        if changed:
-            cfg["custom_providers"] = providers
-            save_config(cfg)
-        return  # already saved, updated if needed
-
     name = name or _auto_provider_name(base_url)
-    entry = {"name": name, "base_url": base_url}
-    if key_env:
-        entry["key_env"] = key_env
-    elif api_key:
-        entry["api_key"] = api_key
-    if model:
-        entry["model"] = model
-    if api_mode:
-        entry["api_mode"] = api_mode
-    if model and context_length:
-        entry["models"] = {model: {"context_length": context_length}}
-
-    providers.append(entry)
-    cfg["custom_providers"] = providers
-    save_config(cfg)
-    print(f'  💾 Saved to custom providers as "{name}" (edit in config.yaml)')
+    changed, _ = upsert_custom_provider_to_providers_dict(
+        cfg, name=name, base_url=base_url, api_key=api_key, model=model,
+        context_length=context_length, api_mode=api_mode or "", key_env=key_env)
+    legacy = cfg.get("custom_providers")
+    if isinstance(legacy, list):
+        kept = [e for e in legacy if not (isinstance(e, dict) and str(e.get("base_url", "")).rstrip("/") == base_url.rstrip("/"))]
+        if len(kept) != len(legacy):
+            changed = True
+            if kept:
+                cfg["custom_providers"] = kept
+            else:
+                cfg.pop("custom_providers", None)
+    if changed:
+        save_config(cfg)
+    print(f'  💾 Saved to providers as "{name}" (edit in config.yaml)')
 
 
 def _remove_custom_provider(config):
-    """Let the user remove a saved custom provider from config.yaml."""
-    from hermes_cli.config import load_config, save_config
+    """Remove a saved provider from modern or legacy config."""
+    from hermes_cli.config import get_compatible_custom_providers, load_config, save_config
     cfg = load_config()
-    providers = cfg.get("custom_providers") or []
-    if not isinstance(providers, list) or not providers:
+    providers = get_compatible_custom_providers(cfg)
+    if not providers:
         print("No custom providers configured.")
         return
 
@@ -516,10 +481,29 @@ def _remove_custom_provider(config):
         print("No change.")
         return
 
-    removed = providers.pop(idx)
-    cfg["custom_providers"] = providers
-    save_config(cfg)
+    removed = providers[idx]
     removed_name = removed.get("name", "unnamed") if isinstance(removed, dict) else str(removed)
+    removed_url = str(removed.get("base_url", "") if isinstance(removed, dict) else "").rstrip("/").lower()
+    changed = False
+    keyed = cfg.get("providers")
+    if isinstance(keyed, dict):
+        for key, entry in list(keyed.items()):
+            if isinstance(entry, dict) and str(entry.get("api", "")).rstrip("/").lower() == removed_url:
+                del keyed[key]
+                changed = True
+        if not keyed:
+            cfg.pop("providers", None)
+    legacy = cfg.get("custom_providers")
+    if isinstance(legacy, list):
+        kept = [e for e in legacy if not (isinstance(e, dict) and str(e.get("base_url", "")).rstrip("/").lower() == removed_url)]
+        if len(kept) != len(legacy):
+            changed = True
+            if kept:
+                cfg["custom_providers"] = kept
+            else:
+                cfg.pop("custom_providers", None)
+    if changed:
+        save_config(cfg)
     print(f'✅ Removed "{removed_name}" from custom providers.')
 
 
@@ -824,7 +808,8 @@ def _build_provider_picker_rows(config: dict, active: str, provider_labels: dict
              bool(active) and key == active)
 
     ordered.append(("custom", "Custom endpoint (enter URL manually)", []))
-    if isinstance(config.get("custom_providers"), list) and config.get("custom_providers"):
+    if ((isinstance(config.get("custom_providers"), list) and config.get("custom_providers"))
+            or (isinstance(config.get("providers"), dict) and config.get("providers"))):
         ordered.append(("remove-custom", "Remove a saved custom provider", []))
     ordered.append(("aux-config", "Configure auxiliary models...", []))
     ordered.append(("cancel", "Leave unchanged", []))

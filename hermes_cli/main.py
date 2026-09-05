@@ -709,6 +709,7 @@ from hermes_cli.main_provider_setup import (
     _named_custom_provider_map,
     _prompt_provider_choice,
     _remove_custom_provider,
+    _save_custom_provider,
 )
 from hermes_cli.main_install_repair import (
     _cleanup_quarantined_exes,

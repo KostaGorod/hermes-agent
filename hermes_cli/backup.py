@@ -1377,7 +1377,7 @@ def create_pre_update_snapshots_all_profiles(
 # inference. Dotted paths into raw config.yaml; a single-element tuple protects a whole section.
 _PROTECTED_CONFIG_PATHS: Tuple[Tuple[str, ...], ...] = (
     ("model", "provider"), ("model", "default"), ("model", "base_url"), ("model", "api_key"),
-    ("moa",))
+    ("moa",), ("providers",), ("custom_providers",))
 
 
 def _read_raw_yaml_dict(path: Path) -> Optional[Dict[str, Any]]:
