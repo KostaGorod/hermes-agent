@@ -204,6 +204,33 @@ async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cancel_task_propagates_caller_cancellation():
+    """Cancelling cleanup must not resurrect the WebSocket loop.
+
+    The helper intentionally consumes the child task's cancellation.  It must
+    distinguish that from a cancellation delivered to the caller while it is
+    awaiting the child's shutdown.
+    """
+    child_cancelling = asyncio.Event()
+
+    async def slow_cancel():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            child_cancelling.set()
+            await asyncio.Event().wait()
+
+    child_task = asyncio.create_task(slow_cancel())
+    await asyncio.sleep(0)
+    cleanup_task = asyncio.create_task(BuzzAdapter._cancel_task(child_task))
+    await asyncio.wait_for(child_cancelling.wait(), 1.0)
+
+    cleanup_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cleanup_task, 1.0)
+
+
+@pytest.mark.asyncio
 async def test_websocket_loop_reconnects_when_liveness_ping_goes_silent(monkeypatch, caplog):
     """A relay close the transport never surfaces must not park the loop.
 

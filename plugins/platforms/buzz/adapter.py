@@ -1061,10 +1061,9 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _cancel_task(task: Optional[asyncio.Task]) -> None:
         if task and not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            # Consume the child's cancellation without swallowing a separate
+            # cancellation delivered to this cleanup's caller.
+            await asyncio.gather(task, return_exceptions=True)
 
     # ── Sending ───────────────────────────────────────────────────────────
 
