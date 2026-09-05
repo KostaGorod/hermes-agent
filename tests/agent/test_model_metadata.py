@@ -1051,7 +1051,9 @@ class TestGetModelContextLength:
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
         base_url = "http://local"
-        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+        with patch(
+            "agent.model_metadata._get_context_cache_path", return_value=cache_file
+        ), patch("agent.model_metadata._query_local_context_length", return_value=None):
             save_context_length("qwen3.5:27b", base_url, 32768)
             result = get_model_context_length(
                 "qwen3.5:27b",
