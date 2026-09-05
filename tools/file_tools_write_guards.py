@@ -12,6 +12,8 @@ import fnmatch
 import os
 from pathlib import Path
 
+from tools.approval_payload import build_approval_payload
+
 from tools.binary_extensions import has_opaque_document_extension, is_pdf_path
 from tools.file_tools_paths import _expand_tilde, _resolve_path_for_task
 
@@ -175,7 +177,8 @@ _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavail
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default",
+                                            approval_payload: dict | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -187,7 +190,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve).")
-    display = f"<write to {targets}>"
+    payload = approval_payload or build_approval_payload(reasons, "write")
+    display = payload["display"]
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
@@ -219,6 +223,7 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             "pattern_key": "protected_instruction_file",
             "pattern_keys": ["protected_instruction_file"],
             "description": description,
+            "approval_payload": payload,
             "allow_permanent": False,
             "allow_session": False}
         decision = _await_gateway_decision(session_key, notify_cb, approval_data, surface="gateway")
@@ -245,7 +250,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(paths: list[str], task_id: str = "default",
+                                       approval_payload: dict | None = None) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
     enabled, extra = _protected_instruction_config()
@@ -255,7 +261,7 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
                            for p in paths) if r]
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(reasons, task_id, approval_payload)
 
 
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:

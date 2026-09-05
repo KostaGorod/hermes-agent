@@ -1580,6 +1580,8 @@ DEFAULT_CONFIG = {
         # globs on the basename (e.g. "*.mdc").
         "protected_instruction_files": True,
         "protected_instruction_extra_patterns": [],
+        # Maximum characters shown in protected-write approval previews; larger payloads use size/hash metadata.
+        "approval_preview_max_chars": 1500,
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,

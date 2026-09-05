@@ -583,9 +583,9 @@ def _redact_approval_command(cmd: "str | None") -> str:
 
 def _format_exec_approval_fallback(
     command: str, description: str, command_prefix: str, *, allow_permanent: bool = True,
-    allow_session: bool = True, smart_denied: bool = False) -> str:
-    """Render the text fallback from approval capabilities, not platform names."""
-    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    allow_session: bool = True, smart_denied: bool = False, approval_payload: dict | None = None) -> str:
+    """Render the text fallback from one shared approval payload."""
+    cmd_preview = (approval_payload or {}).get("display") or (command[:200] + "..." if len(command) > 200 else command)
     heading = ("⚠️ **Smart DENY — owner override for one operation:**" if smart_denied
                else "⚠️ **Dangerous command requires approval:**")
 
