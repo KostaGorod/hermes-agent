@@ -1520,7 +1520,14 @@ class TestContextLengthCache:
         invalidated at step 1 and re-resolved instead of returned."""
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
-        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+        with patch(
+            "agent.model_metadata._get_context_cache_path", return_value=cache_file
+        ), patch(
+            "agent.model_metadata._resolve_endpoint_context_length",
+            return_value=None,
+        ), patch(
+            "agent.model_metadata._query_local_context_length", return_value=None
+        ), patch("agent.model_metadata._query_ollama_api_show", return_value=None):
             # Write the poison entry directly — save_context_length now refuses it.
             cache_file.write_text(
                 "context_lengths:\n  test/model@http://x: 0\n", encoding="utf-8"
@@ -1560,7 +1567,9 @@ class TestContextLengthCache:
     def test_cached_value_takes_priority(self, mock_fetch, tmp_path):
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
-        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+        with patch(
+            "agent.model_metadata._get_context_cache_path", return_value=cache_file
+        ), patch("agent.model_metadata._query_local_context_length", return_value=None):
             save_context_length("unknown/model", "http://local", 65536)
             assert get_model_context_length("unknown/model", base_url="http://local") == 65536
 
