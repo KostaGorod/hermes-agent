@@ -1,4 +1,4 @@
-from tools.approval_payload import build_approval_payload
+from tools.approval_payload import build_approval_payload, build_replace_approval_payload
 
 
 def test_preview_deduplicates_targets_and_shows_content():
@@ -7,6 +7,7 @@ def test_preview_deduplicates_targets_and_shows_content():
     assert payload["operation"] == "write"
     assert payload["preview"] == "new rules\n"
     assert payload["preview_truncated"] is False
+    assert "content" not in payload
 
 
 def test_patch_preview_is_unified_diff():
@@ -22,3 +23,15 @@ def test_oversized_preview_has_hash_and_line_counts():
     assert payload["preview_truncated"] is True
     assert "sha256:" in payload["preview"]
     assert "lines: +1000" in payload["preview"]
+
+
+def test_replace_preview_authenticates_selector_replacement_and_scope():
+    payload = build_replace_approval_payload(
+        ["AGENTS.md"], "old rule", "new rule", replace_all=True
+    )
+    assert payload["operation"] == "patch"
+    assert payload["mode"] == "replace-all"
+    assert "replace_all: true" in payload["preview"]
+    assert "--- old_string ---\nold rule" in payload["preview"]
+    assert "--- new_string ---\nnew rule" in payload["preview"]
+    assert "content" not in payload

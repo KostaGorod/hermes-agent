@@ -34,6 +34,34 @@ class TestTuiApprovalEmitRedaction:
         assert emitted["payload"]["description"] == "x"
         assert "github.com" in emitted["payload"]["command"]
 
+    def test_emit_approval_request_scrubs_payload_metadata(self, monkeypatch):
+        from tui_gateway import server as tui_server
+
+        emitted = {}
+        monkeypatch.setattr(
+            tui_server,
+            "_emit",
+            lambda event, sid, payload=None: emitted.update({"payload": payload}),
+        )
+        raw = "curl -H 'Authorization: token ghp_01...6789' https://api.github.com"
+
+        tui_server._emit_approval_request(
+            "sess-1",
+            {
+                "command": raw,
+                "approval_payload": {
+                    "content": raw * 100,
+                    "preview": raw,
+                    "display": f"<write to AGENTS.md>\n{raw}",
+                },
+            },
+        )
+
+        safe = emitted["payload"]["approval_payload"]
+        assert "content" not in safe
+        assert "ghp_01...6789" not in safe["preview"]
+        assert "ghp_01...6789" not in safe["display"]
+
     @pytest.mark.parametrize(
         ("allow_session", "allow_permanent", "expected"),
         [

@@ -26,7 +26,7 @@ from tools import file_state
 from agent.redact import redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_path_for_task)
-from tools.approval_payload import build_approval_payload
+from tools.approval_payload import build_approval_payload, build_replace_approval_payload
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
@@ -810,9 +810,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return collected
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
-    approval_payload = build_approval_payload(
-        _paths_to_check, "patch" if mode == "patch" else "write",
-        new_content=new_string if mode == "replace" else patch)
+    approval_payload = (
+        build_replace_approval_payload(
+            _paths_to_check,
+            old_string or "",
+            new_string or "",
+            replace_all=replace_all,
+        )
+        if mode == "replace"
+        else build_approval_payload(_paths_to_check, "patch", content=patch)
+    )
     precheck_err = _write_precheck_error(
         _paths_to_check, _content_write_paths, task_id, cross_profile, approval_payload)
     if precheck_err:

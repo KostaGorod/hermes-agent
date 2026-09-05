@@ -581,6 +581,17 @@ def _redact_approval_command(cmd: "str | None") -> str:
     return redact_sensitive_text(str(cmd or ""), force=True)
 
 
+def _redact_approval_payload(payload: dict | None) -> dict | None:
+    """Return the bounded, client-safe approval metadata projection."""
+    if not isinstance(payload, dict):
+        return None
+    safe = {key: value for key, value in payload.items() if key != "content"}
+    for key in ("preview", "display"):
+        if key in safe:
+            safe[key] = _redact_approval_command(safe.get(key))
+    return safe
+
+
 def _format_exec_approval_fallback(
     command: str, description: str, command_prefix: str, *, allow_permanent: bool = True,
     allow_session: bool = True, smart_denied: bool = False, approval_payload: dict | None = None) -> str:

@@ -613,6 +613,8 @@ def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
 
 def _approval_request_payload(data: dict | None) -> dict:
     """Build the client-safe representation of a pending approval."""
+    from gateway.run import _redact_approval_command, _redact_approval_payload
+
     payload = dict(data or {})
     if "choices" not in payload:
         choices = ["once"]
@@ -622,8 +624,11 @@ def _approval_request_payload(data: dict | None) -> dict:
                 choices.append("always")
         payload["choices"] = choices + ["deny"]
     if "command" in payload:
-        from gateway.run import _redact_approval_command
         payload["command"] = _redact_approval_command(payload.get("command"))
+    if payload.get("approval_payload") is not None:
+        payload["approval_payload"] = _redact_approval_payload(
+            payload.get("approval_payload")
+        )
     return payload
 
 

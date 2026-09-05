@@ -19,7 +19,7 @@ def _preview_limit() -> int:
 
 def build_approval_payload(targets, operation: str, *, content: str | None = None,
                            old_content: str | None = None, new_content: str | None = None,
-                           append: bool = False) -> dict:
+                           append: bool = False, mode: str | None = None) -> dict:
     """Build one bounded payload used by CLI, gateway, TUI, and desktop surfaces."""
     unique_targets = list(dict.fromkeys(str(target) for target in targets))
     new_value = new_content if new_content is not None else content
@@ -37,8 +37,7 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
     payload = {
         "targets": unique_targets,
         "operation": kind,
-        "mode": "append" if append else "overwrite",
-        "content": body,
+        "mode": mode or ("append" if append else "overwrite"),
     }
     if len(body) <= _preview_limit():
         payload["preview"] = body
@@ -46,7 +45,7 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
     else:
         payload["preview"] = (
             f"{kind} {payload['mode']} to {', '.join(unique_targets)}\n"
-            f"size: {len(new_value)} chars; sha256: {hashlib.sha256(new_value.encode()).hexdigest()}\n"
+            f"size: {len(body)} chars; sha256: {hashlib.sha256(body.encode()).hexdigest()}\n"
             f"lines: +{len(new_value.splitlines())}"
         )
         if old_content is not None:
@@ -54,7 +53,23 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
             payload["preview"] += f" / -{removed}"
         payload["preview_truncated"] = True
     payload["display"] = (
-        f"<{kind} {'append' if append else 'write'} to {', '.join(unique_targets)}>\n"
+        f"<{kind} {mode or ('append' if append else 'write')} to {', '.join(unique_targets)}>\n"
         f"{payload['preview']}"
     )
     return payload
+
+
+def build_replace_approval_payload(targets, old_string: str, new_string: str,
+                                   *, replace_all: bool = False) -> dict:
+    """Describe the complete requested replacement before any mutation."""
+    body = (
+        f"replace_all: {'true' if replace_all else 'false'}\n"
+        f"--- old_string ---\n{old_string}\n"
+        f"--- new_string ---\n{new_string}"
+    )
+    return build_approval_payload(
+        targets,
+        "patch",
+        content=body,
+        mode="replace-all" if replace_all else "replace-one",
+    )

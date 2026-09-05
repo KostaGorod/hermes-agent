@@ -125,6 +125,46 @@ class TestApprovalCommandWiring:
 
 
 class TestApprovalTextFallbackContract:
+    def test_payload_metadata_is_bounded_and_secret_redacted(self):
+        from gateway.run import _redact_approval_payload
+
+        raw = "token=" + _FAKE_GHP
+        payload = {
+            "targets": ["AGENTS.md"],
+            "operation": "write",
+            "mode": "overwrite",
+            "content": raw * 100,
+            "preview": raw,
+            "display": f"<write to AGENTS.md>\n{raw}",
+        }
+        safe = _redact_approval_payload(payload)
+
+        assert safe is not None
+        assert "content" not in safe
+        assert _FAKE_GHP not in safe["preview"]
+        assert _FAKE_GHP not in safe["display"]
+
+    def test_fallback_uses_redacted_bounded_payload_display(self):
+        from gateway.run import _format_exec_approval_fallback, _redact_approval_payload
+
+        raw = "token=" + _FAKE_GHP
+        safe = _redact_approval_payload(
+            {
+                "targets": ["AGENTS.md"],
+                "operation": "write",
+                "mode": "overwrite",
+                "content": raw * 100,
+                "preview": raw,
+                "display": f"<write to AGENTS.md>\n{raw}",
+            }
+        )
+        text = _format_exec_approval_fallback(
+            "ignored command", "protected write", "/", approval_payload=safe
+        )
+
+        assert _FAKE_GHP not in text
+        assert "<write to AGENTS.md>" in text
+
     def test_smart_deny_only_advertises_one_operation(self):
         from gateway.run import _format_exec_approval_fallback
 

@@ -1232,7 +1232,13 @@ class TurnRunner:
     def _approval_notify_sync(self, approval_data: dict) -> None:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
-        from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
+        from gateway.run import (
+            _approval_send_outcome,
+            _format_exec_approval_fallback,
+            _interim_metadata,
+            _redact_approval_command,
+            _redact_approval_payload,
+        )
         ctx = self._ctx
         adapter = ctx._status_adapter
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
@@ -1242,12 +1248,18 @@ class TurnRunner:
         self._close_native_stream_boundary("Approval")
         # Redact credentials before display: Tirith's findings are already redacted, but the raw
         # command string still leaks secrets. Both the button and plain-text paths use this value.
-        cmd = _redact_approval_command(approval_data.get("command", ""))
+        safe_approval_payload = _redact_approval_payload(
+            approval_data.get("approval_payload")
+        )
+        cmd = _redact_approval_command(
+            (safe_approval_payload or {}).get("display")
+            or approval_data.get("command", "")
+        )
         desc = approval_data.get("description", "dangerous command")
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         fallback_flags = dict(flags)
-        if approval_data.get("approval_payload") is not None:
-            fallback_flags["approval_payload"] = approval_data["approval_payload"]
+        if safe_approval_payload is not None:
+            fallback_flags["approval_payload"] = safe_approval_payload
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if getattr(type(adapter), "send_exec_approval", None) is not None:
             try:
@@ -1256,7 +1268,7 @@ class TurnRunner:
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
                         description=desc,
                         metadata={**(ctx._status_thread_metadata or {}),
-                                  "approval_payload": approval_data.get("approval_payload")},
+                                  "approval_payload": safe_approval_payload},
                         **flags,
                     ),
                     "send_exec_approval scheduling error",

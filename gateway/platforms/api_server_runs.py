@@ -520,14 +520,19 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
+        from gateway.run import _redact_approval_command, _redact_approval_payload
+
         event = dict(approval_data or {})
         # Clients must never receive the raw flagged command: redact before it hits the stream.
         # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
         # #48456, second transport: API/desktop clients would otherwise receive the raw command Tirith
         # flagged. Reuse the gateway seam.
         if "command" in event:
-            from gateway.run import _redact_approval_command
             event["command"] = _redact_approval_command(event.get("command"))
+        if event.get("approval_payload") is not None:
+            event["approval_payload"] = _redact_approval_payload(
+                event.get("approval_payload")
+            )
         event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
             smart_denied=bool(event.get("smart_denied")),
             allow_session=event.get("allow_session") is not False,
