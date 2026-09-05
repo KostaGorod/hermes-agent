@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_common import FTS_TRIGRAM_SQL
 from hermes_cli import session_recovery
 from hermes_cli.session_lost_and_found import (
     STUB_TITLE_PREFIX,
@@ -760,9 +761,24 @@ def _rebuild_with_started_at_appended(conn: sqlite3.Connection) -> None:
     reordered = [r for r in info if r[1] != "started_at"] + [r for r in info if r[1] == "started_at"]
     cols = ", ".join(f'"{c}"' for c in declared)
     conn.executescript("PRAGMA foreign_keys=OFF;")
+    # The trigram external-content view joins ``sessions``. Drop only the
+    # dependent schema while the fixture swaps the table, then let SessionDB
+    # recreate/backfill it when the recovery path opens the source again.
+    for trigger in (
+        "messages_fts_trigram_insert",
+        "messages_fts_trigram_delete",
+        "messages_fts_trigram_update",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+    conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
     conn.execute("CREATE TABLE sessions_new (" + ", ".join(coldef(r) for r in reordered) + ")")
     conn.execute(f"INSERT INTO sessions_new({cols}) SELECT {cols} FROM sessions")
     conn.executescript("DROP TABLE sessions; ALTER TABLE sessions_new RENAME TO sessions;")
+    conn.executescript(FTS_TRIGRAM_SQL)
+    conn.execute(
+        "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('rebuild')"
+    )
 
 
 @pytest.mark.skipif(
