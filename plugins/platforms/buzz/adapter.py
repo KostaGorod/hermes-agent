@@ -21,7 +21,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, cast
 from urllib.parse import urlsplit, urlunsplit
 
 # Profile-scoped read (adapter startup, Slack pattern #59739): a scoped read honors the profile's own
@@ -151,6 +151,110 @@ def _get_scoped_secret(name, default=None):
 
 _UNSCOPED_PROFILE_SECRETS: Optional[Dict[str, str]] = None
 
+# Settings copied by ``_apply_yaml_config`` before adapter construction. Keep
+# this list beside the startup-gate reader so both paths compose the same keys.
+_BRIDGED_EXTRA_KEYS = (
+    "relay_url",
+    "cli_path",
+    "home_channel",
+    "transport",
+    "poll_interval",
+    "channels",
+    "allowed_users",
+    "reaction_only_users",
+    "allow_all_users",
+    "require_mention",
+    "reply_in_thread",
+    "reply_to_mode",
+)
+
+
+def _read_profile_buzz_extra() -> dict:
+    """Return the active profile's effective Buzz extra configuration.
+
+    This mirrors the loader layers needed by the requirement gate, which is
+    called before it receives a PlatformConfig or the YAML env bridge runs.
+    Secondary profiles see nested extras only; the default profile also sees
+    the selected bridge block and legacy gateway.json base.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.config import read_user_config_raw
+
+        home = Path(get_hermes_home())
+        config_path = home / "config.yaml"
+        cfg = read_user_config_raw(config_path)
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if config_path.exists():
+        try:
+            from hermes_cli import managed_scope
+
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+
+    legacy_extra: dict = {}
+    try:
+        legacy = json.loads((home / "gateway.json").read_text(encoding="utf-8"))
+        legacy_block = (legacy.get("platforms") or {}).get("buzz")
+        if isinstance(legacy_block, dict) and isinstance(legacy_block.get("extra"), dict):
+            legacy_extra = legacy_block["extra"]
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    def section(source, key):
+        value = source.get(key) if isinstance(source, dict) else None
+        return value if isinstance(value, dict) else {}
+
+    def block(source, key):
+        value = source.get(key) if isinstance(source, dict) else None
+        return value if isinstance(value, dict) else None
+
+    def extra_only(value):
+        if not isinstance(value, dict):
+            return {}
+        extra = value.get("extra")
+        return extra if isinstance(extra, dict) else {}
+
+    def extra_or_bare(value):
+        if not isinstance(value, dict):
+            return {}
+        extra = value.get("extra", value)
+        return extra if isinstance(extra, dict) else {}
+
+    gateway_cfg = section(cfg, "gateway")
+    gateway_platforms = section(gateway_cfg, "platforms")
+    platforms = section(cfg, "platforms")
+    gateway_platform_block = block(gateway_platforms, "buzz")
+    platforms_block = block(platforms, "buzz")
+    gateway_buzz_block = block(gateway_cfg, "buzz")
+    top_block = block(cfg, "buzz")
+
+    merged = dict(legacy_extra)
+    for value in (gateway_platform_block, platforms_block, gateway_buzz_block):
+        merged.update(extra_only(value))
+    if _profile_scoped():
+        return merged
+
+    bridge_block = next(
+        (
+            value
+            for value in (top_block, gateway_platform_block, platforms_block)
+            if value is not None
+        ),
+        {},
+    )
+    for key in _BRIDGED_EXTRA_KEYS:
+        value = extra_or_bare(bridge_block).get(key)
+        if value:
+            merged[key] = value
+    for key, value in extra_or_bare(top_block).items():
+        merged.setdefault(key, value)
+    return merged
+
 
 def _unscoped_profile_secrets() -> Dict[str, str]:
     """Process-cached profile secret mapping (external resolvers are slow); failures degrade to {}."""
@@ -187,7 +291,8 @@ def _scoped_platform_setting(env_name, extra, key):
 logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
-    BasePlatformAdapter, CachedMedia, SendResult, MessageEvent, MessageType, cache_media_bytes_async,
+    BasePlatformAdapter, CachedMedia, SendResult, MessageEvent, MessageType, ProcessingOutcome,
+    cache_media_bytes_async,
 )
 from gateway.config import Platform
 
@@ -225,6 +330,13 @@ _DM_DISCOVERY_EVERY = 5  # re-run DM discovery every N poll sweeps
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+# Buzz presence records expire after 180 seconds. Refresh no later than 60 seconds,
+# leaving a two-minute margin for clock skew and delayed relay delivery.
+_PRESENCE_EXPIRY = 180.0
+_PRESENCE_REFRESH_MARGIN = 120.0
+_PRESENCE_INTERVAL = min(60.0, _PRESENCE_EXPIRY - _PRESENCE_REFRESH_MARGIN)
+_REACTION_CLEANUP_INTERVAL = 60.0
+_REACTION_CLEANUP_TTL = 300.0
 # Mention-resolution caches: member lists are hit on every publish containing "@"; names must not outlive a rename.
 _MEMBER_CACHE_TTL = 60.0
 _PROFILE_NAME_TTL = 300.0
@@ -265,11 +377,10 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 _WS_AUTH_TIMEOUT = 20.0
-# Last-resort read bound: an unsurfaced relay-side close (CLOSE_WAIT) would leave us "connected" with inbound stopped.
-# The library keepalive (ping_interval/ping_timeout below) should catch a dead relay first, but a relay-side
-# close the transport never surfaces (observed as a CLOSE_WAIT socket with the loop parked on recv, #98097)
-# leaves the gateway "connected" while inbound stops; this timeout forces the normal reconnect path instead.
-_WS_READ_IDLE_TIMEOUT = 300.0
+# Last-resort liveness probe for an unsurfaced relay-side close. Silence alone is
+# healthy; only an unanswered ping forces the normal reconnect path (#98097).
+_WS_LIVENESS_INTERVAL = 60.0
+_WS_LIVENESS_TIMEOUT = 45.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100  # Buzz channel-membership event — live DM discovery
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
@@ -282,6 +393,14 @@ _MARKDOWN_MEDIA_RE = re.compile(
 )
 _BARE_MEDIA_RE = re.compile(_MEDIA_URL_PATTERN, re.IGNORECASE)
 _MEDIA_PATH_RE = re.compile(r"^/media/(?P<sha>[0-9a-f]{64})(?P<ext>\.[a-z0-9]{1,10})?/?$", re.IGNORECASE)
+
+
+def _presence_refresh_interval(refresh: float, expiry: float, margin: float) -> float:
+    """Clamp presence refreshes to land before the relay lease expires."""
+    bounded = expiry - margin
+    if bounded <= 0:
+        bounded = expiry / 2.0
+    return max(0.0, min(refresh, bounded))
 
 
 def _effective_port(parsed) -> Optional[int]:
@@ -412,8 +531,11 @@ def _normalize_user_ref(ref: str) -> Optional[str]:
 
 def _reply_to_mode(config, extra: dict) -> str:
     """Reply mode ("first"/"all" thread, "off" posts flat); env overrides config, ``reply_in_thread: false`` = "off"."""
-    mode = str(os.getenv("BUZZ_REPLY_TO_MODE") or getattr(config, "reply_to_mode", "first") or "first").strip().lower()
-    rit = os.getenv("BUZZ_REPLY_IN_THREAD")
+    mode_env = None if _profile_scoped() else os.getenv("BUZZ_REPLY_TO_MODE")
+    mode = str(mode_env or getattr(config, "reply_to_mode", "first") or "first").strip().lower()
+    rit = _scoped_platform_setting(
+        "BUZZ_REPLY_IN_THREAD", extra, "reply_in_thread"
+    )
     if rit is None:
         rit = extra.get("reply_in_thread")
     return "off" if rit is not None and str(rit).strip().lower() in ("false", "0", "no", "off") else mode
@@ -452,6 +574,13 @@ def _resolve_cli_path(configured: str = "") -> str:
 
 def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
     configured = _configured_credentials_file(extra)
+    if not configured and not _profile_scoped():
+        # The unscoped startup gate has no PlatformConfig argument and runs
+        # before the YAML-to-env bridge. Consult this profile's effective
+        # Buzz config so a config-only credentials_file remains visible.
+        configured = str(
+            _read_profile_buzz_extra().get("credentials_file", "")
+        ).strip()
     if configured:
         return [Path(configured).expanduser()]
     if _is_multiplex_active():
@@ -656,7 +785,11 @@ class BuzzAdapter(BasePlatformAdapter):
         # Entries may be hex or npub (normalized to hex). Reaction-only identities get a 👀 on explicit tags but
         # never dispatch; allowed_users wins on overlap.
         self._allowed_pubkeys: set = _pubkey_set(_setting_or("BUZZ_ALLOWED_USERS", extra, "allowed_users", []))
-        self._reaction_only_pubkeys: set = _pubkey_set(os.getenv("BUZZ_REACTION_ONLY_USERS") or extra.get("reaction_only_users", []))
+        self._reaction_only_pubkeys: set = _pubkey_set(
+            _setting_or(
+                "BUZZ_REACTION_ONLY_USERS", extra, "reaction_only_users", []
+            )
+        )
         # Secret — resolved lazily (never at import time, never logged); connect() re-resolves.
         self._private_key = self._auth_tag = ""
         # Identity — filled in by connect() from ``buzz users get``
@@ -664,6 +797,13 @@ class BuzzAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
+        self._presence_task: Optional[asyncio.Task] = None
+        self._ws_connection = None
+        self._ws_send_lock = asyncio.Lock()
+        self._presence_interval = _PRESENCE_INTERVAL
+        self._presence_expiry = _PRESENCE_EXPIRY
+        self._presence_margin = _PRESENCE_REFRESH_MARGIN
+        self._ws_active = False
         self._membership_since = self._poll_count = 0
         self._lock_key: Optional[str] = None
         # Channels the relay permanently rejected ("restricted"); persists across reconnects so we never re-subscribe.
@@ -685,6 +825,26 @@ class BuzzAdapter(BasePlatformAdapter):
         self._profile_name_cache: Dict[str, Tuple[float, str]] = {}
         # inbound event_id -> thread root (None when top-level), so send() joins the user's thread instead of nesting.
         self._thread_roots: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        reactions_raw = extra.get("reactions", True)
+        if isinstance(reactions_raw, bool):
+            self._reactions_enabled_flag = reactions_raw
+        else:
+            text = str(reactions_raw).strip().lower()
+            if text in ("true", "1", "yes", "on"):
+                self._reactions_enabled_flag = True
+            elif text in ("false", "0", "no", "off"):
+                self._reactions_enabled_flag = False
+            else:
+                logger.warning(
+                    "Buzz: invalid reactions value %r in platforms.buzz.extra; using default true",
+                    reactions_raw,
+                )
+                self._reactions_enabled_flag = True
+        self._reaction_lifecycle: Dict[tuple, dict] = {}
+        self._reaction_tasks: set[asyncio.Task] = set()
+        self._reaction_cleanup_task: Optional[asyncio.Task] = None
+        self._reaction_cleanup_interval = _REACTION_CLEANUP_INTERVAL
+        self._reaction_cleanup_ttl = _REACTION_CLEANUP_TTL
 
     @property
     def name(self) -> str:
@@ -708,6 +868,55 @@ class BuzzAdapter(BasePlatformAdapter):
             self._auth_tag = _resolve_auth_tag(self._extra)
         return await _exec_buzz(self.cli_path, args, relay_url=self.relay_url, private_key=self._private_key,
                                 auth_tag=self._auth_tag, input_text=input_text)
+
+    async def _send_ws(self, websocket, payload: list) -> None:
+        """Serialize frames written through the shared authenticated socket."""
+        async with self._ws_send_lock:
+            await websocket.send(json.dumps(payload, separators=(",", ":")))
+
+    async def _publish_presence(self, websocket, status: str) -> None:
+        """Sign and publish kind-20001 presence on the persistent socket."""
+        event = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: _nostr_auth.build_presence_event(
+                private_key=self._private_key, status=status
+            ),
+        )
+        await self._send_ws(websocket, ["EVENT", event])
+
+    async def _presence_heartbeat(self, websocket) -> None:
+        """Refresh online presence before the relay lease expires."""
+        while True:
+            try:
+                await self._publish_presence(websocket, "online")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Buzz: presence publish failed", exc_info=True)
+            await asyncio.sleep(
+                _presence_refresh_interval(
+                    self._presence_interval,
+                    self._presence_expiry,
+                    self._presence_margin,
+                )
+            )
+
+    async def _stop_presence(self) -> None:
+        """Stop the heartbeat, then publish offline while the socket is open."""
+        await self._cancel_task(self._presence_task)
+        self._presence_task = None
+        websocket = self._ws_connection
+        self._ws_connection = None
+        if websocket is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._publish_presence(websocket, "offline"), timeout=5
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     async def _cli_json(self, args: List[str], default):
         """``_run_cli`` -> parsed stdout on rc 0, else *default*."""
@@ -830,10 +1039,21 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._lock_key = None
+        self._ws_active = False
+        await self._stop_presence()
         await self._cancel_task(self._ws_task)
         self._ws_task = None
         await self._cancel_task(self._poll_task)
         self._poll_task = None
+        pending = [task for task in self._reaction_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await self._cancel_task(self._reaction_cleanup_task)
+        self._reaction_cleanup_task = None
+        self._reaction_tasks.clear()
+        self._reaction_lifecycle = {}
         self._channel_state = {}
         self._poll_count = 0
 
@@ -993,10 +1213,163 @@ class BuzzAdapter(BasePlatformAdapter):
         if not self.cli_path or not emoji or not message_id:
             return False
         # The event id IS the dispatched message_id; channel is not a parameter here.
-        code, _out, err = await self._run_cli(["reactions", "add", "--event", str(message_id), "--emoji", emoji])
+        try:
+            code, _out, err = await self._run_cli(
+                ["reactions", "add", "--event", str(message_id), "--emoji", emoji]
+            )
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction add failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
         if code != 0:
             logger.debug("Buzz: reaction add failed for message %s in %s — %s", message_id[:12], chat_id, _cli_error_message(err, code))
         return code == 0
+
+    async def remove_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Best-effort removal of our exact emoji reaction."""
+        if not self.cli_path or not emoji or not message_id:
+            return False
+        try:
+            code, _out, err = await self._run_cli(
+                ["reactions", "remove", "--event", str(message_id), "--emoji", emoji]
+            )
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
+        if code != 0:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, _cli_error_message(err, code),
+            )
+        return code == 0
+
+    _RECEIVED_EMOJI = "\N{EYES}"
+    _WORKING_EMOJI = "\N{BRAIN}"
+    _OK_EMOJI = "\N{WHITE HEAVY CHECK MARK}"
+    _FAIL_EMOJI = "\N{CROSS MARK}"
+
+    def _reactions_enabled(self) -> bool:
+        return self._reactions_enabled_flag
+
+    def _reaction_begin(self, chat_id: str, message_id: str) -> None:
+        key = (chat_id, message_id)
+        if key in self._reaction_lifecycle:
+            return
+        self._reaction_lifecycle[key] = {
+            "emoji": None,
+            "terminal": False,
+            "tail_task": None,
+            "last_active": time.monotonic(),
+        }
+        self._reaction_transition_enqueue(key, self._RECEIVED_EMOJI)
+        self._ensure_reaction_cleanup()
+
+    def _ensure_reaction_cleanup(self) -> None:
+        if self._reaction_cleanup_task is None or self._reaction_cleanup_task.done():
+            self._reaction_cleanup_task = asyncio.create_task(
+                self._reaction_cleanup_loop()
+            )
+
+    async def _reaction_cleanup_loop(self) -> None:
+        while self._reaction_lifecycle:
+            await asyncio.sleep(self._reaction_cleanup_interval)
+            await self._reaction_cleanup_once()
+
+    async def _reaction_cleanup_once(self) -> None:
+        now = time.monotonic()
+        stale = []
+        for key, state in self._reaction_lifecycle.items():
+            if now - state.get("last_active", 0) < self._reaction_cleanup_ttl:
+                continue
+            tail = state.get("tail_task")
+            if tail is not None and not tail.done():
+                tail.cancel()
+            stale.append(key)
+        for key in stale:
+            self._reaction_lifecycle.pop(key, None)
+
+    def _reaction_transition_enqueue(
+        self, key: tuple, desired: Optional[str], *, terminal: bool = False,
+    ) -> None:
+        state = self._reaction_lifecycle.get(key)
+        if state is None or state["terminal"]:
+            return
+        if terminal:
+            state["terminal"] = True
+        state["last_active"] = time.monotonic()
+        task = asyncio.create_task(
+            self._reaction_transition_run(
+                key, desired, state.get("tail_task"), terminal
+            )
+        )
+        state["tail_task"] = task
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _reaction_transition_run(
+        self, key: tuple, desired: Optional[str], prev: Optional[asyncio.Task], terminal: bool,
+    ) -> None:
+        try:
+            if prev is not None:
+                try:
+                    await prev
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            state = self._reaction_lifecycle.get(key)
+            if state is None:
+                return
+            chat_id, message_id = key
+            current = state["emoji"]
+            if desired != current:
+                if current is not None:
+                    if not await self.remove_reaction(chat_id, message_id, current):
+                        return
+                    state["emoji"] = None
+                if desired is not None and await self.send_reaction(
+                    chat_id, message_id, desired
+                ):
+                    state["emoji"] = desired
+        finally:
+            if terminal:
+                self._reaction_lifecycle.pop(key, None)
+
+    def _reaction_eligible(self, event: MessageEvent) -> bool:
+        if not getattr(event, "message_id", None) or not self._reactions_enabled():
+            return False
+        if not isinstance(getattr(event, "text", None), str) or event.is_command():
+            return False
+        if self._authorization_check is None:
+            return True
+        decision = self._is_sender_authorized(
+            getattr(event.source, "user_id", None),
+            chat_type=getattr(event.source, "chat_type", None),
+            chat_id=getattr(event.source, "chat_id", None),
+        )
+        return decision is True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        key = (getattr(event.source, "chat_id", None), getattr(event, "message_id", None))
+        if key in self._reaction_lifecycle:
+            self._reaction_transition_enqueue(key, self._WORKING_EMOJI)
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome,
+    ) -> None:
+        key = (getattr(event.source, "chat_id", None), getattr(event, "message_id", None))
+        if key not in self._reaction_lifecycle:
+            return
+        desired = {
+            ProcessingOutcome.SUCCESS: self._OK_EMOJI,
+            ProcessingOutcome.FAILURE: self._FAIL_EMOJI,
+        }.get(outcome)
+        self._reaction_transition_enqueue(key, desired, terminal=True)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """Edit a sent message (streamed replies). The CLI reports a NEW event id but the stream consumer
@@ -1230,47 +1603,109 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("Buzz: WebSocket discovery sweep failed", exc_info=True)
 
+    async def _probe_liveness(self, websocket) -> None:
+        """Demand proof of transport life via a connection-level ping/pong."""
+        ping_fn = getattr(websocket, "ping", None)
+        if not callable(ping_fn):
+            return
+        pong_waiter = await cast("Awaitable[Any]", ping_fn())
+        if pong_waiter is not None:
+            await pong_waiter
+
+    async def _read_frame_or_probe(self, frame_iter, websocket) -> str:
+        """Keep waiting for frames while bounded pings prove a quiet socket alive."""
+        read_task = asyncio.ensure_future(frame_iter.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {read_task}, timeout=_WS_LIVENESS_INTERVAL
+                )
+                if done:
+                    return read_task.result()
+                try:
+                    await asyncio.wait_for(
+                        self._probe_liveness(websocket),
+                        timeout=_WS_LIVENESS_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    raise ConnectionError(
+                        "relay did not answer a liveness ping within "
+                        f"{_WS_LIVENESS_TIMEOUT:.0f}s; assuming the connection went silent"
+                    ) from None
+        finally:
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     async def _websocket_loop(self) -> None:
-        """Persistent authenticated subscription with bounded reconnect backoff; `since` filters resume on reconnect."""
+        """Persistent authenticated subscription with bounded reconnect backoff."""
         import websockets
         backoff = 1.0
-        while True:
-            try:
-                async with websockets.connect(
-                    self._websocket_url(), open_timeout=_WS_AUTH_TIMEOUT, close_timeout=5,
-                    ping_interval=20, ping_timeout=20, max_size=_WS_MAX_MESSAGE_BYTES,
-                ) as websocket:
-                    await self._authenticate_websocket(websocket)
-                    subscriptions = await self._subscribe_websocket(websocket)
-                    if self._ws_ready is not None:
-                        self._ws_ready.set()
-                    backoff = 1.0
-                    discovery_task = asyncio.create_task(self._ws_discovery_loop(websocket, subscriptions))
-                    try:
-                        await self._ws_read_loop(websocket, subscriptions)
-                    finally:
-                        discovery_task.cancel()
+        try:
+            while True:
+                try:
+                    async with websockets.connect(
+                        self._websocket_url(), open_timeout=_WS_AUTH_TIMEOUT,
+                        close_timeout=5, ping_interval=20, ping_timeout=20,
+                        max_size=_WS_MAX_MESSAGE_BYTES,
+                    ) as websocket:
+                        await self._authenticate_websocket(websocket)
+                        subscriptions = await self._subscribe_websocket(websocket)
+                        self._ws_active = True
+                        self._ws_connection = websocket
                         try:
-                            await discovery_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                            await self._publish_presence(websocket, "online")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning("Buzz: initial presence publish failed", exc_info=True)
+                        loop_task = asyncio.current_task()
+                        if loop_task is not None and loop_task.cancelling():
+                            raise asyncio.CancelledError()
+                        self._presence_task = asyncio.create_task(
+                            self._presence_heartbeat(websocket)
+                        )
+                        if self._ws_ready is not None:
+                            self._ws_ready.set()
+                        backoff = 1.0
+                        discovery_task = asyncio.create_task(
+                            self._ws_discovery_loop(websocket, subscriptions)
+                        )
+                        try:
+                            await self._ws_read_loop(websocket, subscriptions)
+                        finally:
+                            discovery_task.cancel()
+                            await asyncio.gather(discovery_task, return_exceptions=True)
+                            await self._cancel_task(self._presence_task)
+                            self._presence_task = None
+                            if self._ws_connection is websocket:
+                                self._ws_connection = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    loop_task = asyncio.current_task()
+                    if loop_task is not None and loop_task.cancelling():
+                        raise asyncio.CancelledError() from exc
+                    self._ws_active = False
+                    logger.warning(
+                        "Buzz: WebSocket disconnected; retrying in %.1fs: %s",
+                        backoff, exc,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+        finally:
+            self._ws_active = False
 
     async def _ws_read_loop(self, websocket, subscriptions: Dict[str, Optional[str]]) -> None:
-        """Read frames until the relay closes; an idle read raises ConnectionError to reconnect."""
+        """Read relay frames; a clean iterator close reconnects without warning/backoff."""
         frame_iter = websocket.__aiter__()
         while True:
             try:
-                raw = await asyncio.wait_for(frame_iter.__anext__(), timeout=_WS_READ_IDLE_TIMEOUT)
+                raw = await self._read_frame_or_probe(frame_iter, websocket)
             except StopAsyncIteration:
                 return
-            except asyncio.TimeoutError:
-                raise ConnectionError(f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; assuming the connection went silent") from None
             try:
                 message = json.loads(raw)
             except (ValueError, TypeError):
@@ -1902,29 +2337,16 @@ class BuzzAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text,
             reply_to_author_id=reply_to_author_id, reply_to_is_own_message=reply_to_is_own_message,
         )
+        if self._reaction_eligible(event):
+            self._reaction_begin(chat_id, message_id)
         await self.handle_message(event)
-        # "Seen" reaction: signals the message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
 
 
 # ── Plugin registration ──────────────────────────────────────────────────────
 
 def _profile_buzz_extra() -> dict:
     """``buzz.extra`` from the scoped profile's config.yaml for ``check_requirements``; failures yield {} (fail closed)."""
-    if not _profile_scoped():
-        return {}
-    try:
-        from hermes_constants import get_hermes_home
-        from hermes_cli.config import read_user_config_raw
-        cfg = read_user_config_raw(Path(get_hermes_home()) / "config.yaml")
-    except Exception:
-        return {}
-    buzz = ((cfg.get("gateway") or {}).get("platforms") or {}).get("buzz") if isinstance(cfg, dict) else None
-    extra = buzz.get("extra", buzz) if isinstance(buzz, dict) else None
-    return extra if isinstance(extra, dict) else {}
+    return _read_profile_buzz_extra() if _profile_scoped() else {}
 
 
 def check_requirements() -> bool:
@@ -1935,8 +2357,14 @@ def check_requirements() -> bool:
         # an unconfigured profile fails closed. See #98738.
         extra = _profile_buzz_extra()
         return bool(str(extra.get("relay_url") or "").strip() and _resolve_private_key(extra))
-    # The gate runs before per-profile scopes install; the relay can be externally managed too.
-    return bool((_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip()) and bool(_resolve_private_key())
+    # The gate runs before the YAML-to-env bridge. Fall back to this profile's
+    # effective config for non-secret locator fields, while private key material
+    # remains in the secret scope or its declared credentials file.
+    extra = _read_profile_buzz_extra()
+    relay = (_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip()
+    return bool(relay or str(extra.get("relay_url") or "").strip()) and bool(
+        _resolve_private_key(extra)
+    )
 
 
 def validate_config(config) -> bool:
@@ -1987,7 +2415,7 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     for src, env, kind in _YAML_BRIDGE:
         val = extra.get(src)
         missing = {"str": not val, "csv": val is None}.get(kind, src not in extra)
-        if missing or (kind != "thread" and skip_env_bridge) or os.getenv(env):
+        if missing or skip_env_bridge or os.getenv(env):
             continue
         if kind == "csv" and isinstance(val, (list, tuple)):
             val = ",".join(str(v) for v in val)
@@ -2053,8 +2481,14 @@ async def _standalone_send(
         escaped = _escape_unresolved_presentation_mention(message, err) if code != 0 else None
         if escaped is not None:
             logger.info("Buzz: retrying standalone message after unresolved presentation-mention preflight")
-            # Retry intentionally omits auth_tag (legacy behavior).
-            code, out, err = await _exec_buzz(cli_path, args, relay_url=relay, private_key=private_key, input_text=escaped)
+            code, out, err = await _exec_buzz(
+                cli_path,
+                args,
+                relay_url=relay,
+                private_key=private_key,
+                auth_tag=auth_tag,
+                input_text=escaped,
+            )
     except asyncio.CancelledError:
         raise
     except OSError as e:
