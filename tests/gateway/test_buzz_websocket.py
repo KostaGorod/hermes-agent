@@ -189,8 +189,11 @@ async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
     monkeypatch.setattr(_ws_mod, "connect", fake_connect)
 
     task = asyncio.create_task(adapter._websocket_loop())
-    # Auth handshake consumes a couple of ticks; leave room for ≥2 probes.
-    await asyncio.sleep(0.2)
+    # Wait for the observable contract instead of assuming a fixed number of
+    # event-loop turns; this file also runs under a heavily parallel wrapper.
+    deadline = time.monotonic() + 5.0
+    while (not sockets or sockets[0].ping_count < 2) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5.0)
