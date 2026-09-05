@@ -1634,10 +1634,10 @@ class BuzzAdapter(BasePlatformAdapter):
                     ) from None
         finally:
             read_task.cancel()
-            try:
-                await read_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            # Retrieve the child cancellation without catching the parent
+            # task's CancelledError. Catching both in one ``except`` can
+            # swallow shutdown and leave the read loop alive indefinitely.
+            await asyncio.gather(read_task, return_exceptions=True)
 
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect backoff."""
