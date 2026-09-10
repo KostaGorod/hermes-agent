@@ -83,9 +83,34 @@ def _module_isolation():
     """
     saved = {name: mod for name, mod in sys.modules.items()
              if name.startswith(_RELOAD_PREFIXES)}
-    yield
-    _drop_reload_targets()
-    sys.modules.update(saved)
+    # Imports also publish children on their parent packages. Restoring only
+    # sys.modules leaves patch("hermes_cli.config.*") addressing a stale copy.
+    missing = object()
+    parents = []
+    for name in set(saved) | set(_RELOAD_PREFIXES):
+        parent_name, _, child = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            parents.append((parent, child, getattr(parent, child, missing)))
+    try:
+        yield
+    finally:
+        # First-imported siblings have no saved module entry, but import still
+        # attached them to a surviving parent package.
+        for name in set(sys.modules) - set(saved):
+            if name.startswith(_RELOAD_PREFIXES):
+                parent_name, _, child = name.rpartition(".")
+                parent = sys.modules.get(parent_name)
+                if parent is not None and getattr(parent, child, missing) is sys.modules[name]:
+                    delattr(parent, child)
+        _drop_reload_targets()
+        sys.modules.update(saved)
+        for parent, child, previous in parents:
+            if previous is missing:
+                if hasattr(parent, child):
+                    delattr(parent, child)
+            else:
+                setattr(parent, child, previous)
 
 
 def _fresh_modules():

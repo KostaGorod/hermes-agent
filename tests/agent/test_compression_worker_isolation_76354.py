@@ -341,7 +341,17 @@ def test_f5_session_contextvar_rebound_after_rotation(
         lambda cfg=None: (5.0, 10.0),
     )
 
-    # Simulate the gateway's bound session context for the caller.
+    # A gateway clear deliberately masks env fallbacks; this test must instead
+    # leave the enclosing caller's context exactly as it found it.
+    from gateway import session_context
+    from agent.runtime_cwd import _SESSION_CWD
+
+    variables = (*session_context._SESSION_VARS,
+                 session_context._SESSION_ASYNC_DELIVERY,
+                 session_context._SESSION_HISTORY_DELIVERY, _SESSION_CWD)
+    prior_tokens = [(var, var.set(var.get())) for var in variables]
+    monkeypatch.setattr(session_context, "_session_context_engaged",
+                        session_context._session_context_engaged)
     tokens = set_session_vars(session_id=parent_sid, platform="telegram")
     try:
         assert get_session_env("HERMES_SESSION_ID") == parent_sid
@@ -357,3 +367,5 @@ def test_f5_session_contextvar_rebound_after_rotation(
         )
     finally:
         clear_session_vars(tokens)
+        for var, token in reversed(prior_tokens):
+            var.reset(token)

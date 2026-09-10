@@ -3480,6 +3480,15 @@ class TestCodexAuxiliaryAdapterCacheScope:
     and tools happen to match.
     """
 
+    @pytest.fixture(autouse=True)
+    def _restore_runtime_mirrors(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        # reset_runtime_main restores the ContextVar, not the legacy mirrors.
+        for field in (*aux._MAIN_RUNTIME_FIELDS, "compat_snapshot"):
+            name = f"_RUNTIME_MAIN_{field.upper()}"
+            monkeypatch.setattr(aux, name, getattr(aux, name))
+
     def _create_and_capture(self, *, session_id):
         import agent.auxiliary_client as aux
 

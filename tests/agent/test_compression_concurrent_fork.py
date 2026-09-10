@@ -1593,7 +1593,13 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
 
     try:
         with patch.object(AIAgent, "run_conversation", _run_threshold_crossing_review):
-            br._run_review_in_thread(parent, snapshot, "review this conversation")
+            # The production thread has its own context; retain that boundary
+            # when driving its target synchronously here.
+            from contextvars import copy_context
+
+            copy_context().run(
+                br._run_review_in_thread, parent, snapshot, "review this conversation"
+            )
 
         assert captured["compression_calls"] >= 1, (
             "FIX REGRESSION: the review fork did not compact its oversized "
