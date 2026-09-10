@@ -16,9 +16,27 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.turn_context import TurnContext, build_turn_context  # noqa: F401
 from run_agent import AIAgent
 from tests.agent.test_turn_context import _FakeAgent, _build
+
+
+@pytest.fixture(autouse=True)
+def _restore_runtime_main(monkeypatch):
+    """Preflight-only tests never run the turn finalizer that releases the binding."""
+    from agent import auxiliary_client
+
+    context = auxiliary_client._RUNTIME_MAIN_CONTEXT
+    token = context.set(context.get())
+    for field in (*auxiliary_client._MAIN_RUNTIME_FIELDS, "compat_snapshot"):
+        name = f"_RUNTIME_MAIN_{field.upper()}"
+        monkeypatch.setattr(auxiliary_client, name, getattr(auxiliary_client, name))
+    try:
+        yield
+    finally:
+        context.reset(token)
 
 
 class _FakeUncompressedAgent(_FakeAgent):

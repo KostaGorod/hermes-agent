@@ -159,7 +159,10 @@ class TestCustomProviderModelSwitch:
         )
         config = yaml.safe_load(config_path.read_text()) or {}
         assert config["model"]["api_key"] == "${EXAMPLE_PROVIDER_API_KEY}"
-        assert config["custom_providers"][0]["api_key"] == "${EXAMPLE_PROVIDER_API_KEY}"
+        assert "custom_providers" not in config
+        provider = next(iter(config["providers"].values()))
+        assert provider["api_key"] == "${EXAMPLE_PROVIDER_API_KEY}"
+        assert provider["api"] == "https://api.example-provider.test/v1"
         assert "sk-live-example-provider" not in config_path.read_text()
 
     def test_key_env_custom_provider_persists_reference_not_secret(self, config_home, monkeypatch):
@@ -195,7 +198,10 @@ class TestCustomProviderModelSwitch:
 
         config = yaml.safe_load(config_path.read_text()) or {}
         assert config["model"]["api_key"] == "${EXAMPLE_PROVIDER_API_KEY}"
-        assert config["custom_providers"][0]["key_env"] == "EXAMPLE_PROVIDER_API_KEY"
+        assert "custom_providers" not in config
+        provider = next(iter(config["providers"].values()))
+        assert provider["key_env"] == "EXAMPLE_PROVIDER_API_KEY"
+        assert provider["api"] == "https://api.example-provider.test/v1"
         assert "sk-live-example-provider" not in config_path.read_text()
 
     def test_env_ref_base_url_preserves_api_key_ref_through_picker(
@@ -260,7 +266,10 @@ class TestCustomProviderModelSwitch:
         saved = config_path.read_text()
         config = yaml.safe_load(saved) or {}
         assert config["model"]["api_key"] == "${NEURALWATT_API_KEY}"
-        assert config["custom_providers"][0]["api_key"] == "${NEURALWATT_API_KEY}"
+        assert "custom_providers" not in config
+        provider = next(iter(config["providers"].values()))
+        assert provider["api_key"] == "${NEURALWATT_API_KEY}"
+        assert provider["api"] == "https://api.neuralwatt.com/v1"
         assert "sk-live-neuralwatt-secret" not in saved
 
 

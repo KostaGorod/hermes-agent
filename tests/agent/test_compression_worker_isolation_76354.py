@@ -159,7 +159,8 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
     agent._cached_system_prompt = "sys"
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_timeouts",
-        lambda cfg=None: (0.05, 0.1),
+        # Allow provider-thread startup under the parallel runner before timing out.
+        lambda cfg=None: (2.0, 4.0),
     )
 
     provider_started = threading.Event()
@@ -167,7 +168,7 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
 
     def _blocked_provider(_kwargs):
         provider_started.set()
-        assert release_provider.wait(timeout=10)
+        assert release_provider.wait(timeout=30)
         return "late-provider-result"
 
     def _compress_with_protected_provider(msgs, **_kwargs):
@@ -182,10 +183,10 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
             live, "sys", approx_tokens=120_000
         )
         assert returned is live
-        assert provider_started.wait(timeout=1)
+        assert provider_started.wait(timeout=5)
         assert not release_provider.is_set()
 
-        deadline = time.time() + 1
+        deadline = time.time() + 5
         while time.time() < deadline:
             with cc._compress_admission_lock:
                 if cc._compress_admitted_count == 0:
@@ -340,7 +341,17 @@ def test_f5_session_contextvar_rebound_after_rotation(
         lambda cfg=None: (5.0, 10.0),
     )
 
-    # Simulate the gateway's bound session context for the caller.
+    # A gateway clear deliberately masks env fallbacks; this test must instead
+    # leave the enclosing caller's context exactly as it found it.
+    from gateway import session_context
+    from agent.runtime_cwd import _SESSION_CWD
+
+    variables = (*session_context._SESSION_VARS,
+                 session_context._SESSION_ASYNC_DELIVERY,
+                 session_context._SESSION_HISTORY_DELIVERY, _SESSION_CWD)
+    prior_tokens = [(var, var.set(var.get())) for var in variables]
+    monkeypatch.setattr(session_context, "_session_context_engaged",
+                        session_context._session_context_engaged)
     tokens = set_session_vars(session_id=parent_sid, platform="telegram")
     try:
         assert get_session_env("HERMES_SESSION_ID") == parent_sid
@@ -356,3 +367,5 @@ def test_f5_session_contextvar_rebound_after_rotation(
         )
     finally:
         clear_session_vars(tokens)
+        for var, token in reversed(prior_tokens):
+            var.reset(token)

@@ -66,6 +66,14 @@ _PROVIDER_ENV_HINTS = (
 
 
 @doctor_check()
+def _check_legacy_custom_providers(should_fix: bool, f: Finding) -> None:
+    from hermes_cli.config import load_config
+    config = load_config()
+    if isinstance(config.get("custom_providers"), list):
+        check_warn("Legacy custom_providers list found; it will be migrated to the keyed providers section on next save.")
+
+
+@doctor_check()
 def _check_auth_providers(should_fix: bool, f: Finding) -> None:
     """Refresh-free OAuth status snapshot (doctor must never trigger a token refresh)."""
     with warn_on_error("Auth provider status", "(could not check: {e})"):
@@ -110,7 +118,7 @@ DOCTOR_CHECKS = (
     ('Security Advisories', _check_security_advisories), ('MCP Server Security', _check_mcp_security),
     ('Python Environment', _check_python_environment), ('SSL / CA Certificates', _check_certificates),
     ('Required Packages', _check_required_packages), ('Configuration Files', _check_env_file),
-    (None, _check_config_file), (None, _check_config_drift),
+    (None, _check_config_file), (None, _check_config_drift), (None, _check_legacy_custom_providers),
     ('xAI Model Retirement (May 15, 2026)', _check_xai_retirement),
     ('Plugin import paths (removed Sep 14, 2026)', _check_plugin_compat), ('Auth Providers', _check_auth_providers),
     ('Directory Structure', _check_directory_structure), (None, _check_state_db),

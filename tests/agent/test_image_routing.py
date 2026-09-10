@@ -192,7 +192,7 @@ class TestShouldProbeOllamaVision:
         # A remote sglang/vLLM endpoint must NEVER be fingerprinted — that's
         # the 401-spray bug from #89863.
         assert _should_probe_ollama_vision(
-            "custom", "https://my-remote-host/v1"
+            "custom", "https://my-remote-host.example.com/v1"
         ) is False
 
     def test_remote_endpoint_not_probed_without_key(self):

@@ -358,6 +358,8 @@ class TestDefaultContextLengths:
             "deepseek-v4-flash": 1_000_000,
             "deepseek-chat": 1_000_000,
             "deepseek-reasoner": 1_000_000,
+            # Version-less canonical Flash id (2026-09 Flash refresh).
+            "deepseek-flash": 1_000_000,
         }
         for key, value in expected_keys.items():
             assert key in DEFAULT_CONTEXT_LENGTHS, f"{key} missing"
@@ -379,6 +381,8 @@ class TestDefaultContextLengths:
                 ("deepseek/deepseek-v4-flash", 1_000_000),
                 ("deepseek-chat", 1_000_000),
                 ("deepseek-reasoner", 1_000_000),
+                ("deepseek-flash", 1_000_000),
+                ("deepseek/deepseek-flash", 1_000_000),
             ]
             for model_id, expected_ctx in cases:
                 actual = get_model_context_length(model_id)
@@ -1051,7 +1055,9 @@ class TestGetModelContextLength:
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
         base_url = "http://local"
-        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+        with patch(
+            "agent.model_metadata._get_context_cache_path", return_value=cache_file
+        ), patch("agent.model_metadata._query_local_context_length", return_value=None):
             save_context_length("qwen3.5:27b", base_url, 32768)
             result = get_model_context_length(
                 "qwen3.5:27b",
@@ -1088,13 +1094,14 @@ class TestGetModelContextLength:
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {}
 
-        # GLM-5-TEE matches the "glm" entry in DEFAULT_CONTEXT_LENGTHS
+        # GLM-5-TEE resolves through DEFAULT_CONTEXT_LENGTHS (longest matching GLM key), not the generic default.
         result = get_model_context_length(
             "zai-org/GLM-5-TEE",
             base_url="https://llm.chutes.ai/v1",
             api_key="test-key",
         )
-        assert result == 202752  # "glm" entry in DEFAULT_CONTEXT_LENGTHS
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS, _longest_key_match
+        assert result == _longest_key_match(DEFAULT_CONTEXT_LENGTHS, "zai-org/glm-5-tee")[1]
 
 
 
@@ -1518,7 +1525,14 @@ class TestContextLengthCache:
         invalidated at step 1 and re-resolved instead of returned."""
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
-        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+        with patch(
+            "agent.model_metadata._get_context_cache_path", return_value=cache_file
+        ), patch(
+            "agent.model_metadata._resolve_endpoint_context_length",
+            return_value=None,
+        ), patch(
+            "agent.model_metadata._query_local_context_length", return_value=None
+        ), patch("agent.model_metadata._query_ollama_api_show", return_value=None):
             # Write the poison entry directly — save_context_length now refuses it.
             cache_file.write_text(
                 "context_lengths:\n  test/model@http://x: 0\n", encoding="utf-8"
@@ -1558,7 +1572,9 @@ class TestContextLengthCache:
     def test_cached_value_takes_priority(self, mock_fetch, tmp_path):
         mock_fetch.return_value = {}
         cache_file = tmp_path / "cache.yaml"
-        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+        with patch(
+            "agent.model_metadata._get_context_cache_path", return_value=cache_file
+        ), patch("agent.model_metadata._query_local_context_length", return_value=None):
             save_context_length("unknown/model", "http://local", 65536)
             assert get_model_context_length("unknown/model", base_url="http://local") == 65536
 

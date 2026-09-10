@@ -20,7 +20,7 @@ from agent.models_dev import (
     ModelCapabilities, ModelInfo, get_model_capabilities, get_model_info, list_provider_models)
 from utils import base_url_hostname, base_url_origin
 # Re-exported: callers/tests patch hermes_cli.model_switch.<name>.
-from hermes_cli.model_switch_providers import list_authenticated_providers
+from hermes_cli.model_switch_providers import list_authenticated_providers, _save_discovered_models_to_config
 
 
 logger = logging.getLogger(__name__)

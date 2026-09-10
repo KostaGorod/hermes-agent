@@ -1180,6 +1180,21 @@ def check_respawn_guard(
     if lane == "review":
         return None
 
+    # A reviewer returning the same card to its implementer is an explicit
+    # request to update the existing PR. The PR URL remains on the card, so
+    # bypass the ordinary active_pr guard until review is requested again.
+    latest_review_transition = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN ('review_requested', 'changes_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if (
+        latest_review_transition is not None
+        and latest_review_transition["kind"] == "changes_requested"
+    ):
+        return None
+
     # 3. Completed run within guard window. Exception: an explicit re-queue
     #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
     #    a deliberate "run it again" — otherwise a manual done→ready would sit
@@ -1226,9 +1241,11 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     return profile_exists
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+def _has_spawnable_in_lane(
+    conn: sqlite3.Connection, status: str, lane: str,
+) -> bool:
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
         (status,),
     ).fetchall()
@@ -1238,7 +1255,16 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    for row in rows:
+        if not profile_exists(row["assignee"]):
+            continue
+        try:
+            deferred = check_respawn_guard(conn, row["id"], lane=lane)
+        except Exception:
+            return True
+        if deferred is None:
+            return True
+    return False
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -1248,12 +1274,12 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
     back to "any assigned" when ``profile_exists`` is unimportable.
     """
-    return _has_spawnable(conn, "ready")
+    return _has_spawnable_in_lane(conn, "ready", "ready")
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+    return _has_spawnable_in_lane(conn, "review", "review")
 
 
 def review_dispatch_enabled() -> bool:
@@ -2246,6 +2272,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
     # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg
+    # This is the grant boundary: the dispatcher assigned this new worker's task.
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    env.pop(DELEGATED_CHILD_ENV_MARKER, None)
     # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
@@ -2255,6 +2284,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
     cmd = _restart_safe_worker_argv(task, cmd)
+    from tools.process_registry import systemd_user_bus_env
+    env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above

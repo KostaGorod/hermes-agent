@@ -230,6 +230,7 @@ def _normalize_custom_provider_entry(
             normalized[field] = value
 
     _put("api_key", _stripped("api_key"))
+    _put("key_cmd", _stripped("key_cmd"))
     key_env = _stripped("key_env", "api_key_env")
     _put("key_env", key_env)
     if key_env and entry.get("api_key_env") and not entry.get("key_env"):
@@ -253,7 +254,7 @@ def _normalize_custom_provider_entry(
     for field, ok in (
         ("context_length", lambda v: isinstance(v, int) and v > 0),
         ("rate_limit_delay", lambda v: isinstance(v, (int, float)) and v >= 0),
-        ("discover_models", lambda v: isinstance(v, bool)),
+        ("discover_models", lambda v: isinstance(v, (bool, str))),
     ):
         if ok(entry.get(field)):
             normalized[field] = entry[field]
@@ -282,7 +283,7 @@ def _custom_provider_entry_to_provider_config(
 
     provider_entry: Dict[str, Any] = {"api": normalized["base_url"]}
     for field in (
-        "name", "api_key", "key_env", "models", "models_discovered", "context_length",
+        "name", "api_key", "key_env", "key_cmd", "models", "models_discovered", "context_length",
         "rate_limit_delay", "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify"):
         if field in normalized:
@@ -306,6 +307,52 @@ def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, An
         if normalized is not None:
             custom_providers.append(normalized)
     return custom_providers
+
+
+def upsert_custom_provider_to_providers_dict(
+    cfg: Dict[str, Any], *, name: str, base_url: str, api_key: str = "",
+    key_env: str = "", model: str = "", context_length: Optional[int] = None,
+    api_mode: str = "",
+) -> Tuple[bool, str]:
+    """Upsert a custom endpoint in the keyed providers config shape."""
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        cfg["providers"] = providers
+    norm = str(base_url or "").strip().rstrip("/").lower()
+    key = next((k for k, entry in providers.items()
+                if isinstance(entry, dict) and str(entry.get("api", "")).strip().rstrip("/").lower() == norm), None)
+    if key is None:
+        key = str(name or "").strip().lower().replace(" ", "-").replace("(", "").replace(")", "")
+        key = re.sub(r"-{2,}", "-", key).strip("-")
+        if not key:
+            key = (urlparse(str(base_url or "")).hostname or "endpoint").replace(".", "-")
+        base = key
+        n = 0
+        while key in providers:
+            key = f"{base}-{n}"
+            n += 1
+    entry = providers.get(key) if isinstance(providers.get(key), dict) else {}
+    changed = False
+    for field, value in (("name", name), ("api", base_url), ("key_env", key_env),
+                         ("default_model", model), ("transport", api_mode), ("context_length", context_length)):
+        if value not in (None, "") and entry.get(field) != value:
+            entry[field] = value
+            changed = True
+    if key_env and entry.pop("api_key", None) is not None:
+        changed = True
+    elif not key_env and api_key and entry.get("api_key") != api_key:
+        entry["api_key"] = api_key
+        changed = True
+    if model and context_length:
+        models = entry.setdefault("models", {})
+        if models.get(model) != {"context_length": context_length}:
+            models[model] = {"context_length": context_length}
+            changed = True
+    if changed or key not in providers:
+        providers[key] = entry
+        changed = True
+    return changed, str(key)
 
 
 def get_compatible_custom_providers(
@@ -499,15 +546,23 @@ def get_custom_provider_context_length(
             raw = config.get("custom_providers")
             custom_providers = raw if isinstance(raw, list) else []
 
-    for model_cfg in _route_model_cfgs(model, base_url, custom_providers, config):
-        raw_ctx = model_cfg.get("context_length")
-        if raw_ctx is None:
-            continue
+    def _positive_int(raw: Any) -> Optional[int]:
         try:
-            ctx = int(raw_ctx)
+            ctx = int(raw)
         except (TypeError, ValueError):
-            continue
-        if ctx > 0:
+            return None
+        return ctx if ctx > 0 else None
+
+    for model_cfg in _route_model_cfgs(model, base_url, custom_providers, config):
+        ctx = _positive_int(model_cfg.get("context_length"))
+        if ctx is not None:
+            return ctx
+    # Entry-level ``context_length`` (a documented key) backs every model the entry serves when no
+    # per-model override exists; without it the /model switch re-derivation fell to the hardcoded
+    # catalog while a cold start honoured the same setting via model.context_length (#98387).
+    for entry in _entries_for_route(base_url, custom_providers, config):
+        ctx = _positive_int(entry.get("context_length"))
+        if ctx is not None:
             return ctx
     return None
 

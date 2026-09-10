@@ -30,6 +30,7 @@ def _make_agent(
     monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("model_tools.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr("agent.agent_init.query_ollama_num_ctx", lambda *_args, **_kwargs: None)
     return AIAgent(
         api_key="test-key",
         base_url="http://test",
