@@ -13,11 +13,12 @@
 # between (config-schema bumps, venv layout changes, dependency floors).
 #
 # Usage:
-#   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR]
+#   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR] [--tag-regex REGEX]
 #
 #   --count   how many tags to emit (default 5, minimum 1). Fewer tags than
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
+#   --tag-regex  extended regex selecting release tags (default: official CalVer).
 #
 # Reads tags from the local checkout, so it needs one fetched with tags
 # (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
@@ -34,6 +35,7 @@ COUNT=5
 # path so a symlinked or copied script still reads the checkout it lives in
 # rather than whatever repo the caller happens to be standing in.
 REPO=""
+TAG_REGEX='^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --count)
@@ -42,6 +44,9 @@ while [ "$#" -gt 0 ]; do
     --repo)
       [ "$#" -ge 2 ] || { echo 'error: --repo needs a value' >&2; exit 1; }
       REPO="$2"; shift 2 ;;
+    --tag-regex)
+      [ "$#" -ge 2 ] || { echo 'error: --tag-regex needs a value' >&2; exit 1; }
+      TAG_REGEX="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -68,7 +73,7 @@ fi
 # lexicographic sort gets wrong.
 mapfile -t tags < <(
   git -C "$REPO" tag --list 'v*' \
-    | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+    | grep -E "$TAG_REGEX" \
     | sort -V
 )
 

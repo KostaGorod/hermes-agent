@@ -2135,6 +2135,29 @@ def git_result(*args, cwd=None):
     )
 
 
+
+def repo_url_from_origin() -> str:
+    """Return the GitHub web URL for origin, falling back to the official repo."""
+    origin = git("remote", "get-url", "origin")
+    match = re.search(r"github\.com[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?$", origin)
+    return f"https://github.com/{match.group('repo')}" if match else "https://github.com/NousResearch/hermes-agent"
+
+
+def next_fork_tag(upstream_tag: str, suffix: str) -> str:
+    """Return v<upstream>-<suffix>.N without mixing with upstream tags."""
+    if not re.fullmatch(r"v[0-9]{4}\.[0-9]+\.[0-9]+(?:\.[0-9]+)?", upstream_tag):
+        raise ValueError("--fork-base must be an upstream CalVer tag such as v2026.9.14")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", suffix):
+        raise ValueError("--fork-suffix must contain lowercase letters, digits, or hyphens")
+    prefix = f"{upstream_tag}-{suffix}."
+    patches = []
+    for tag in git("tag", "--list", f"{prefix}*").splitlines():
+        match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)", tag)
+        if match:
+            patches.append(int(match.group(1)))
+    return f"{prefix}{max(patches, default=0) + 1}"
+
+
 def get_last_tag():
     """Get the most recent CalVer tag."""
     tags = git("tag", "--list", "v20*", "--sort=-v:refname")
@@ -2496,6 +2519,10 @@ def main():
                         help="Mark as first release (no previous tag expected)")
     parser.add_argument("--output", type=str,
                         help="Write changelog to file instead of stdout")
+    parser.add_argument("--fork-base", type=str,
+                        help="Upstream CalVer tag used as this fork release base (for example v2026.9.14)")
+    parser.add_argument("--fork-suffix", type=str, default="kg",
+                        help="Fork release suffix used with --fork-base (default: kg)")
     args = parser.parse_args()
 
     # Determine CalVer date
@@ -2506,9 +2533,16 @@ def main():
         calver_date = f"{now.year}.{now.month}.{now.day}"
 
     base_tag = f"v{calver_date}"
-    tag_name, calver_date = next_available_tag(base_tag)
-    if tag_name != base_tag:
-        print(f"Note: Tag {base_tag} already exists, using {tag_name}")
+    if args.fork_base:
+        try:
+            tag_name = next_fork_tag(args.fork_base, args.fork_suffix)
+        except ValueError as exc:
+            parser.error(str(exc))
+        calver_date = args.fork_base.removeprefix("v")
+    else:
+        tag_name, calver_date = next_available_tag(base_tag)
+        if tag_name != base_tag:
+            print(f"Note: Tag {base_tag} already exists, using {tag_name}")
 
     # Determine semver
     current_version = get_current_version()
@@ -2518,7 +2552,12 @@ def main():
         new_version = current_version
 
     # Get previous tag
-    prev_tag = get_last_tag()
+    if args.fork_base:
+        fork_pattern = f"{args.fork_base}-{args.fork_suffix}.*"
+        fork_tags = git("tag", "--list", fork_pattern, "--sort=-v:refname")
+        prev_tag = fork_tags.splitlines()[0] if fork_tags else args.fork_base
+    else:
+        prev_tag = get_last_tag()
     if not prev_tag and not args.first_release:
         print("No previous tags found. Use --first-release for the initial release.")
         print(f"Would create tag: {tag_name}")
@@ -2547,9 +2586,16 @@ def main():
     # Generate changelog
     changelog = generate_changelog(
         commits, tag_name, new_version,
+        repo_url=repo_url_from_origin(),
         prev_tag=prev_tag,
         first_release=args.first_release,
     )
+    if args.fork_base:
+        provenance = (
+            f"> Fork release `{tag_name}` is based on upstream `{args.fork_base}`; "
+            f"changes below are the `{args.fork_suffix}` patch series on top.\n\n"
+        )
+        changelog = changelog.replace("\n\n", "\n\n" + provenance, 1)
 
     if args.output:
         Path(args.output).write_text(changelog, encoding="utf-8")

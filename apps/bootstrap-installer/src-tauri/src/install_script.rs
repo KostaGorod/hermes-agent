@@ -323,8 +323,14 @@ fn upgrade_cached_script(kind: ScriptKind, cached: &Path, emit_log: &impl Fn(&st
 /// packets) never errors — the whole bootstrap would hang here instead of
 /// falling back to the cached script.
 async fn download(kind: ScriptKind, commit_or_ref: &str, dest_path: &Path) -> Result<()> {
+    let repository = std::env::var("HERMES_REPOSITORY")
+        .unwrap_or_else(|_| "NousResearch/hermes-agent".to_string());
+    let repository = repository.trim_matches('/');
+    if repository.split('/').count() != 2 || repository.contains("..") {
+        return Err(anyhow!("invalid HERMES_REPOSITORY `{repository}`; expected owner/repo"));
+    }
     let url = format!(
-        "https://raw.githubusercontent.com/NousResearch/hermes-agent/{}/scripts/{}",
+        "https://raw.githubusercontent.com/{repository}/{}/scripts/{}",
         commit_or_ref,
         kind.filename()
     );

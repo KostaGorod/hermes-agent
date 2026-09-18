@@ -7,6 +7,7 @@ resolving/monkeypatching. Origin helpers are imported lazily per function (no cy
 import logging
 from contextlib import suppress
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -379,7 +380,10 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         )
         _m().sys.exit(1)
     _abort_zip_update_if_dirty_tree()
-    _download_and_swap_zip(branch, f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip")
+    origin_url = _m()._get_origin_url(["git"], _m().PROJECT_ROOT) if (_m().PROJECT_ROOT / ".git").exists() else None
+    match = re.search(r"github\.com[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?$", origin_url or "")
+    repository = match.group("repo") if match else os.environ.get("HERMES_REPOSITORY", "NousResearch/hermes-agent")
+    _download_and_swap_zip(branch, f"https://github.com/{repository}/archive/refs/heads/{branch}.zip")
     _sweep_bytecode_after_update(branch)
     # Self-lock deferral: the code swap is committed; defer only the dependency sync when this process
     # holds a native extension the sync must rewrite.
