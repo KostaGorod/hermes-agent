@@ -45,6 +45,8 @@ on:
       # Release tags only: the repo also carries backup/* and one-off tags.
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-kg.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+-kg.[0-9]+'
 
 permissions:
   contents: read
@@ -61,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      tags: ${{ steps.pick.outputs.tags }}
+      matrix: ${{ steps.pick.outputs.matrix }}
     steps:
       # This job only reads tag names and runs one script, so take the cheap
       # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
@@ -72,20 +74,40 @@ jobs:
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
-      # This fork carries no release tags of its own; the released versions a
-      # user can update FROM live on the upstream repo, which is also where the
-      # e2e sandbox installs them from (HERMES_DEV_SANDBOX_UPSTREAM). Fetch
-      # upstream's release tags into this runner checkout so the picker sees
-      # them. Refs stay local to the runner; nothing is pushed to the fork.
-      - name: Fetch upstream release tags
-        run: |
-          git fetch -q "${HERMES_DEV_SANDBOX_UPSTREAM:-https://github.com/NousResearch/hermes-agent.git}" 'refs/tags/v*:refs/tags/v*'
+      # Keep upstream and fork tags in separate repositories. Importing both
+      # into refs/tags/v* makes equal names collide and gives the picker a mixed
+      # release pool once this fork starts publishing its own releases.
       - id: pick
+        env:
+          UPSTREAM_REPOSITORY: NousResearch/hermes-agent
+          FORK_REPOSITORY: KostaGorod/hermes-agent
         run: |
           set -euo pipefail
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
-          echo "Testing updates from: $tags"
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          upstream_repo="$RUNNER_TEMP/hermes-upstream-tags"
+          git init -q "$upstream_repo"
+          git -C "$upstream_repo" fetch -q \
+            "https://github.com/$UPSTREAM_REPOSITORY.git" \
+            'refs/tags/v*:refs/tags/v*'
+          upstream_tags="$(scripts/sandbox/pick-release-tags.sh \
+            --repo "$upstream_repo" \
+            --count '${{ inputs.tag-count || 5 }}')"
+
+          fork_tags='[]'
+          if git tag --list 'v*-kg.*' | grep -q .; then
+            fork_tags="$(scripts/sandbox/pick-release-tags.sh \
+              --count '${{ inputs.tag-count || 5 }}' \
+              --tag-regex '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?-kg\.[1-9][0-9]*$')"
+          fi
+
+          matrix="$(jq -cn \
+            --arg upstream "$UPSTREAM_REPOSITORY" \
+            --arg fork "$FORK_REPOSITORY" \
+            --argjson upstream_tags "$upstream_tags" \
+            --argjson fork_tags "$fork_tags" \
+            '{include: ([$upstream_tags[] | {repository: $upstream, ref: .}]
+              + [$fork_tags[] | {repository: $fork, ref: .}])}')"
+          echo "Testing release sources: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   # `hermes update` -- the route most users take.
   update:
@@ -96,11 +118,12 @@ jobs:
       # failed, so let every leg report.
       fail-fast: false
       matrix:
-        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
+        release: ${{ fromJSON(needs.pick-releases.outputs.matrix).include }}
     uses: ./.github/workflows/install-e2e-run.yml
     with:
       route: update
-      install-ref: ${{ matrix.install-ref }}
+      install-ref: ${{ matrix.release.ref }}
+      repository: ${{ matrix.release.repository }}
 
   # Re-running the curl one-liner over an existing checkout: autostash + pull
   # rather than the updater's own git handling.
@@ -111,8 +134,9 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
+        release: ${{ fromJSON(needs.pick-releases.outputs.matrix).include }}
     uses: ./.github/workflows/install-e2e-run.yml
     with:
       route: installer
-      install-ref: ${{ matrix.install-ref }}
+      install-ref: ${{ matrix.release.ref }}
+      repository: ${{ matrix.release.repository }}
