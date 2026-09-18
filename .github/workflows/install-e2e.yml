@@ -72,6 +72,14 @@ jobs:
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
+      # This fork carries no release tags of its own; the released versions a
+      # user can update FROM live on the upstream repo, which is also where the
+      # e2e sandbox installs them from (HERMES_DEV_SANDBOX_UPSTREAM). Fetch
+      # upstream's release tags into this runner checkout so the picker sees
+      # them. Refs stay local to the runner; nothing is pushed to the fork.
+      - name: Fetch upstream release tags
+        run: |
+          git fetch -q "${HERMES_DEV_SANDBOX_UPSTREAM:-https://github.com/NousResearch/hermes-agent.git}" 'refs/tags/v*:refs/tags/v*'
       - id: pick
         run: |
           set -euo pipefail
