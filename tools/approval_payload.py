@@ -44,26 +44,18 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
     target_text = ", ".join(unique_targets)
     prefix = (f"{header} to {target_text}\n"
               f"SHA-256 of full {mode} proposal text (UTF-8): {digest}\n")
+    # QQ's native approval text renderer accepts only 300 preview characters.
+    # Compact summaries fit that ceiling; retain the configured budget for
+    # non-summary payload construction and force a truthful compact fallback.
     budget = _preview_limit()
-    if len(prefix) + len(proposal) <= budget:
-        body = prefix + proposal
+    fits_transport = len(prefix) + len(proposal) <= min(budget, 300)
+    if fits_transport:
+        display = prefix + proposal
     else:
-        # Keep all semantic fields even when the proposal or path list is too large.
-        max_paths = max(32, budget - 420)
-        shown_targets = target_text if len(target_text) <= max_paths else (
-            target_text[:max_paths - 100] + f" … [paths omitted; full path-list SHA-256 {path_digest}]"
-        )
-        body = (f"{header}; targets ({len(unique_targets)}): {shown_targets}\n"
-                f"Proposal: {len(proposal.encode('utf-8'))} UTF-8 bytes, {len(proposal.splitlines())} lines\n"
-                f"SHA-256 of full {mode} proposal text (UTF-8): {digest}\n"
-                "Preview redacted before display; digest is of the original proposal.")
-    display = body[:budget]
-    if len(body) > budget:
-        # QQ's real text renderer caps command_preview at 300 characters. Keep
-        # every transport's protected-write display within that bound and make
-        # omission explicit rather than letting a renderer silently truncate it.
-        display = (f"{mode}; proposal omitted from preview; full proposal SHA-256 (UTF-8): {digest}")
-        if len(display) > budget:
-            display = f"{mode}; SHA-256 (UTF-8): {digest}"
+        # Preserve scope and proposal identity in a compact fallback that fits
+        # QQ's 300-character transport limit.
+        display = (f"{mode}; proposal omitted from preview; targets={len(unique_targets)}; "
+                   f"ordered target-list SHA-256={path_digest}; "
+                   f"proposal SHA-256={digest}")
     return {"display": display, "operation": operation, "mode": mode,
-            "proposal_sha256": digest, "preview_truncated": len(prefix) + len(proposal) > budget}
+            "proposal_sha256": digest, "preview_truncated": not fits_transport}
