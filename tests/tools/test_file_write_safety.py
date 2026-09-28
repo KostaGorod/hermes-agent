@@ -683,6 +683,22 @@ class TestProtectedInstructionFiles:
         assert secret not in shown
         assert "Overwrite (creates if absent)" in shown
 
+    def test_qq_write_uses_qq_preview_budget(self, tmp_path, approvals, monkeypatch):
+        from tools.approval_payload import build_approval_payload
+
+        monkeypatch.setattr("tools.approval_context._get_session_platform", lambda: "qqbot")
+        target = tmp_path / "AGENTS.md"
+        proposal = "benign marker\n" + "x" * 500
+        self._write(target, proposal)
+
+        shown = approvals["calls"][0]["command"]
+        expected = build_approval_payload([str(target)], "write", content=proposal, max_chars=300)
+        assert shown == expected["display"]
+        assert len(shown) <= 300
+        assert expected["proposal_sha256"] in shown
+        assert expected["target_list_sha256"] in shown
+        assert "proposal omitted from preview" in shown
+
     def test_replace_approval_discloses_replace_all_scope(self, tmp_path, approvals):
         from tools.file_tools import patch_tool
         import json
