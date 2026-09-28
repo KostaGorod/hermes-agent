@@ -43,10 +43,10 @@ def _save_discovered_models_to_config(
         changed = False
         candidates = []
         keyed = cfg.get("providers")
-        if isinstance(keyed, dict):
+        if provider_key and isinstance(keyed, dict):
             candidates.extend(
                 (entry, key) for key, entry in keyed.items()
-                if isinstance(entry, dict) and (not provider_key or str(key).lower() == provider_key.lower()))
+                if isinstance(entry, dict) and str(key).lower() == provider_key.lower())
         legacy = cfg.get("custom_providers")
         if not provider_key and isinstance(legacy, list):
             candidates.extend((entry, "") for entry in legacy if isinstance(entry, dict))
