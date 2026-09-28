@@ -1471,7 +1471,7 @@ class TurnRunner:
         # Redact credentials before display: Tirith's findings are already redacted, but the raw
         # command string still leaks secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
-        desc = approval_data.get("description", "dangerous command")
+        desc = _redact_approval_command(approval_data.get("description", "dangerous command"))
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
@@ -1538,7 +1538,9 @@ class TurnRunner:
                 logger.warning("Button-based approval failed, falling back to text: %s", e)
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
-        msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
+        msg = _format_exec_approval_fallback(
+            cmd, desc, getattr(adapter, "typed_command_prefix", "/"),
+            protected_write=approval_data.get("pattern_key") == "protected_instruction_file", **flags)
         try:
             # Mark as approval prompt so WeCom routes through the control lane.
             metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}

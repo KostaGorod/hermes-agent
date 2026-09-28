@@ -111,8 +111,8 @@ def _ask_human(command: str, description: str, timeout_seconds: int, allow_perma
     # Redact before any user-visible rendering; the original `command` still executes after approval. Same redactor as
     # memory/log sanitization so tokens mask consistently across surfaces.
     from agent.redact import redact_sensitive_text
-    display_command = redact_sensitive_text(command)
-    display_description = redact_sensitive_text(description)
+    display_command = redact_sensitive_text(command, force=True)
+    display_description = redact_sensitive_text(description, force=True)
     # Smart DENY and a session-less gate both reduce the menu to once/deny.
     once_only = smart_denied or not allow_session
 

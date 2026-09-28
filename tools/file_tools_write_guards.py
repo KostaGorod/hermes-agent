@@ -256,7 +256,8 @@ _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavail
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default",
+                                            approval_payload: dict | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -268,7 +269,7 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve).")
-    display = f"<write to {targets}>"
+    display = (approval_payload or {}).get("display") or f"<write to {targets}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
@@ -331,7 +332,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(paths: list[str], task_id: str = "default",
+                                       proposal: dict | None = None) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
     enabled, extra = _protected_instruction_config()
@@ -341,7 +343,16 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
                            for p in paths) if r]
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    payload = None
+    if proposal is not None:
+        try:
+            from tools.approval_payload import build_approval_payload
+            payload = build_approval_payload(paths, **proposal)
+        except Exception:
+            # Approval display is part of consent; a broken preview must never
+            # silently fall back to the old target-only prompt.
+            return "BLOCKED: protected write approval preview could not be built. No file was changed."
+    return _request_protected_instruction_approval(reasons, task_id, payload)
 
 
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:
