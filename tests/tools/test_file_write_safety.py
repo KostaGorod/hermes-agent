@@ -673,6 +673,46 @@ class TestProtectedInstructionFiles:
         assert target.read_text(encoding="utf-8") == "approved content"
         assert len(approvals["calls"]) == 1
 
+    def test_cli_approval_discloses_redacted_write_proposal(self, tmp_path, approvals):
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        approvals["answer"] = "deny"
+        self._write(tmp_path / "AGENTS.md", f"benign marker\nTOKEN={secret}\n")
+
+        shown = approvals["calls"][0]["command"]
+        assert "benign marker" in shown
+        assert secret not in shown
+        assert "Overwrite (creates if absent)" in shown
+
+    def test_qq_write_uses_qq_preview_budget(self, tmp_path, approvals, monkeypatch):
+        from tools.approval_payload import build_approval_payload
+
+        monkeypatch.setattr("tools.approval_context._get_session_platform", lambda: "qqbot")
+        target = tmp_path / "AGENTS.md"
+        proposal = "benign marker\n" + "x" * 500
+        self._write(target, proposal)
+
+        shown = approvals["calls"][0]["command"]
+        expected = build_approval_payload([str(target)], "write", content=proposal, max_chars=300)
+        assert shown == expected["display"]
+        assert len(shown) <= 300
+        assert expected["proposal_sha256"] in shown
+        assert expected["target_list_sha256"] in shown
+        assert "proposal omitted from preview" in shown
+
+    def test_replace_approval_discloses_replace_all_scope(self, tmp_path, approvals):
+        from tools.file_tools import patch_tool
+        import json
+        target = tmp_path / "AGENTS.md"
+        target.write_text("x x", encoding="utf-8")
+        approvals["answer"] = "deny"
+        result = json.loads(patch_tool(mode="replace", path=str(target), old_string="x",
+                                       new_string="y", replace_all=True))
+
+        assert result.get("error")
+        shown = approvals["calls"][0]["command"]
+        assert "Replace all matches" in shown
+        assert '"replace_all":true' in shown
+
     def test_prompts_even_under_yolo(self, tmp_path, approvals, monkeypatch):
         """The whole point: auto-approve/yolo must NOT bypass this gate."""
         import tools.approval as A

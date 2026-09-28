@@ -72,6 +72,13 @@ class TestApprovalTextFallbackContract:
         assert "approve session" not in text
         assert "approve always" not in text
 
+    def test_protected_write_text_fallback_preserves_bounded_preview(self):
+        from gateway.run import _format_exec_approval_fallback
+
+        preview = "x" * 400
+        text = _format_exec_approval_fallback(preview, "protected", "/", protected_write=True)
+        assert preview in text
+
     def test_text_fallback_says_silence_means_no(self, monkeypatch):
         """Surfaces without buttons get the same deadline line as the button card."""
         from gateway.run import _format_exec_approval_fallback

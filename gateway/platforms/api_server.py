@@ -116,9 +116,12 @@ def _approval_request_event(run_id: str, approval_data: Optional[Dict[str, Any]]
     envelope, and the ``choices`` the client may send back to ``POST /v1/runs/{id}/approval``."""
     from gateway.platforms.api_server_runs import _run_event
     event = dict(approval_data or {})
-    if "command" in event:
+    if "command" in event or "description" in event:
         from gateway.run import _redact_approval_command
-        event["command"] = _redact_approval_command(event.get("command"))
+        if "command" in event:
+            event["command"] = _redact_approval_command(event.get("command"))
+        if "description" in event:
+            event["description"] = _redact_approval_command(event.get("description"))
     event.update(_run_event(run_id, "approval.request", **fields, choices=_approval_event_choices(
         smart_denied=bool(event.get("smart_denied")),
         allow_session=event.get("allow_session") is not False,
