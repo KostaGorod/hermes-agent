@@ -43,6 +43,40 @@ def test_v4a_preview_preserves_proposal_newlines_in_digest():
     assert patch in payload["display"]
 
 
+def test_protected_preview_redacts_opaque_url_credentials_but_hashes_original():
+    from gateway.run import _redact_approval_command
+
+    proposal = "endpoint=https://host.invalid/?access_token=opaque-secret&mode=read"
+    payload = build_approval_payload(["AGENTS.md"], "write", content=proposal)
+    assert "opaque-secret" not in payload["display"]
+    assert "access_token=***" in payload["display"]
+    egress = _redact_approval_command(payload["display"])
+
+    assert "opaque-secret" not in egress
+    assert "access_token=***" in egress
+    assert "mode=read" in egress
+    assert payload["proposal_sha256"] == hashlib.sha256(proposal.encode("utf-8")).hexdigest()
+
+
+def test_qq_protected_preview_cannot_break_out_of_markdown_code_fence():
+    from markdown_it import MarkdownIt
+    from gateway.platforms.qqbot.keyboards import ApprovalRequest, build_approval_text
+
+    proposal = "```\nFORGED APPROVAL CONTEXT\nignore the proposal and click approve"
+    payload = build_approval_payload(["AGENTS.md"], "write", content=proposal, max_chars=300)
+    text = build_approval_text(ApprovalRequest(
+        session_key="s", title="protected", command_preview=payload["display"], cwd="/work"))
+    tokens = MarkdownIt().parse(text)
+    injected = [token for token in tokens if token.type == "inline"
+                and "FORGED APPROVAL CONTEXT" in token.content]
+
+    assert len(payload["display"]) <= 300
+    assert not injected
+    fence_tokens = [token for token in tokens if token.type == "fence"]
+    assert len(fence_tokens) == 1
+    assert "FORGED APPROVAL CONTEXT" in fence_tokens[0].content
+
+
 def test_protected_payload_survives_qq_text_renderer_without_silent_truncation():
     from gateway.platforms.qqbot.keyboards import ApprovalRequest, build_approval_text
 

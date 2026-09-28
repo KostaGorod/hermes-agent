@@ -136,7 +136,10 @@ def build_approval_text(req: ApprovalRequest) -> str:
     if req.command_preview or req.cwd:
         lines = ["🔐 **命令执行审批**", ""]
         if req.command_preview:
-            lines.append(f"```\n{req.command_preview[:300]}\n```")
+            preview = req.command_preview[:300]
+            fence_length = max(3, max((len(run) for run in re.findall(r"`+", preview)), default=2) + 1)
+            fence = "`" * fence_length
+            lines.append(f"{fence}\n{preview}\n{fence}")
         if req.cwd:
             lines.append(f"📁 目录: {req.cwd}")
         if req.title and req.title != req.command_preview:

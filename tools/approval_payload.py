@@ -44,6 +44,8 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
         budget = min(budget, max(_MIN_PREVIEW_MAX_CHARS, min(max_chars, _MAX_PREVIEW_MAX_CHARS)))
 
     digest = hashlib.sha256(proposal.encode("utf-8")).hexdigest()
+    from agent.redact import _redact_strict_url_credentials
+    display_proposal = _redact_strict_url_credentials(proposal)
     target_json = json.dumps(unique_targets, ensure_ascii=False, separators=(",", ":"))
     path_digest = hashlib.sha256(target_json.encode("utf-8")).hexdigest()
     target_text = ", ".join(unique_targets)
@@ -51,7 +53,7 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
     def _display_for_budget(limit: int) -> tuple[str, bool]:
         full = (f"{header} to {target_text}\n"
                 f"SHA-256 of full {mode} proposal text (UTF-8): {digest}\n"
-                f"{proposal}")
+                f"{display_proposal}")
         if len(full) <= limit:
             return full, False
 
@@ -63,8 +65,8 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
         compact_prefix = (f"{header} to {target_names} [targets={len(unique_targets)}; "
                           f"ordered target-list SHA-256={path_digest}]\n"
                           f"Proposal SHA-256={digest}\n")
-        if len(compact_prefix) + len(proposal) <= limit:
-            return compact_prefix + proposal, False
+        if len(compact_prefix) + len(display_proposal) <= limit:
+            return compact_prefix + display_proposal, False
 
         summary = (f"{mode}; proposal omitted from preview; targets={len(unique_targets)}; "
                    f"ordered target-list SHA-256={path_digest}; proposal SHA-256={digest}")
