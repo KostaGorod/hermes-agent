@@ -269,10 +269,23 @@ def _git_run(git_cmd, args, cwd=None, *, check=False, network=False):
         # so every caller's existing stderr path prints one clear line.
         result = subprocess.CompletedProcess(
             exc.cmd, 124, stdout="",
-            stderr=f"git {args[0]} timed out after {NETWORK_GIT_TIMEOUT_SECONDS}s with no response from the remote")
+            stderr=f"git {args[0]} timed out after {NETWORK_GIT_TIMEOUT_SECONDS}s (a stalled remote, or a transfer too large for the limit)")
         if check:
             raise subprocess.CalledProcessError(124, exc.cmd, output="", stderr=result.stderr) from exc
         return result
+
+
+def _heal_stale_shallow_checkout(repo_root: Path, branch: str) -> None:
+    """Unshallow a shallow checkout before the bounded fetch (#123254). Non-fatal: on failure the
+    update proceeds with the fetch it always ran."""
+    from hermes_cli.gitlock import heal_shallow_history
+
+    try:
+        if heal_shallow_history(repo_root, branch, **_no_prompt_git_kwargs()):
+            print("  ✓ Fetched the commit history this shallow checkout was missing")
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = (getattr(exc, "stderr", None) or str(exc)).strip().splitlines()[-1:] or [type(exc).__name__]
+        print(f"  ⚠ Could not fetch the missing commit history ({detail[0]}); a very stale install may time out")
 
 
 def _capture_head_sha(git_cmd, cwd) -> str | None:
@@ -1418,13 +1431,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # runs and failed restores preserve the stash but nothing ever mentioned it again.
         _m()._warn_orphaned_update_autostashes(git_cmd, _m().PROJECT_ROOT)
 
+        # A shallow checkout's plain fetch drags in ~the whole history and cannot finish inside
+        # the network cap (#123254); its grafts also make merge-base report orphan divergence
+        # (#123346, #124645). Unshallow it (commits only) first.
+        _heal_stale_shallow_checkout(_m().PROJECT_ROOT, branch)
+
         print("→ Fetching updates...")
         if release_sha:
-            fetch_result = _git_run(git_cmd, ["fetch", "--no-tags", "origin", target_ref], network=True)
+            fetch_args = ["fetch", "--no-tags", "origin", target_ref]
         else:
-            fetch_result = _git_run(
-                git_cmd, ["fetch", "origin", _check.tracking_refspec("origin", branch)], network=True)
+            fetch_args = ["fetch", "origin", _check.tracking_refspec("origin", branch)]
+        from hermes_cli.gitlock import fetch_with_partial_clone_recovery, is_partial_clone_pack_objects_crash
+        # One retry with the promisor machinery disabled clears the git 2.53/2.54
+        # partial-clone pack-objects crash (#124272).
+        fetch_result = fetch_with_partial_clone_recovery(
+            lambda gc, a: _git_run(gc, a, network=True), git_cmd, fetch_args)
         if fetch_result.returncode != 0:
+            if is_partial_clone_pack_objects_crash(fetch_result.stderr or ""):
+                print("✗ git still crashed after the partial-clone retry. Heal the checkout once manually:")
+                print("  git -c remote.origin.promisor= fetch origin && git fetch origin")
             _print_fetch_failure(fetch_result.stderr)
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(1)
