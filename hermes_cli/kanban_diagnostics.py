@@ -695,6 +695,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if not assignee.strip():
         return []
 
+    events = list(events)
     # Most recent event that put the task into ready; with none (old task /
     # truncated events) fall back to created_at — over-flagging an ancient
     # task beats missing a stranded one.
@@ -707,6 +708,32 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     age_seconds = now - last_ready_ts
     if age_seconds < threshold_seconds:
         return []
+
+    # A recorded guard explains a held dispatch, not a missing worker. Keep the
+    # diagnostic read-only and historical: the event alone cannot prove the
+    # guard is still active, so render its reason/time without a reassign action.
+    latest_guard = next((ev for ev in reversed(events)
+                         if _event_kind(ev) == "respawn_guarded"), None)
+    if latest_guard is not None:
+        payload = _parse_payload(latest_guard)
+        reason = str(payload.get("reason") or "unknown")
+        guard_ts = _event_ts(latest_guard)
+        clearing_kinds = {
+            "promoted", "unblocked", "assigned", "changes_requested", "review_reopened",
+            "completed", "archived",
+        }
+        if not any(_event_kind(ev) in clearing_kinds and _event_ts(ev) > guard_ts for ev in events):
+            return [Diagnostic(
+                kind="stranded_in_ready", severity="info",
+                title=f"Ready task has recorded {reason} guard",
+                detail="Dispatch recorded a respawn guard for this task. The event is historical; "
+                       "check current dispatcher output before treating the guard as active.",
+                actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
+                first_seen_at=guard_ts, last_seen_at=guard_ts, count=1,
+                data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+                      "assignee": assignee, "guard_reason": reason, "guard_recorded_at": guard_ts,
+                      "threshold_seconds": int(threshold_seconds)},
+            )]
 
     age_str = f"{age_seconds / 3600:.1f}h" if age_seconds >= 3600 else f"{int(age_seconds / 60)}m"
     # Escalate with age: <2x threshold warning, 2x-6x error, >6x critical.
