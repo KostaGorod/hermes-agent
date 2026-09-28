@@ -21,7 +21,8 @@ def _preview_limit() -> int:
 
 def build_approval_payload(targets, operation: str, *, content: str | None = None,
                            old_string: str | None = None, new_string: str | None = None,
-                           patch: str | None = None, replace_all: bool = False) -> dict:
+                           patch: str | None = None, replace_all: bool = False,
+                           max_chars: int | None = None) -> dict:
     """Return a bounded display whose digest identifies the exact submitted proposal text."""
     unique_targets = list(dict.fromkeys(str(target) for target in targets))
     if operation == "write":
@@ -38,24 +39,38 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
     else:
         raise ValueError("unsupported protected-write operation")
 
+    budget = _preview_limit()
+    if isinstance(max_chars, int) and not isinstance(max_chars, bool):
+        budget = min(budget, max(_MIN_PREVIEW_MAX_CHARS, min(max_chars, _MAX_PREVIEW_MAX_CHARS)))
+
     digest = hashlib.sha256(proposal.encode("utf-8")).hexdigest()
     target_json = json.dumps(unique_targets, ensure_ascii=False, separators=(",", ":"))
     path_digest = hashlib.sha256(target_json.encode("utf-8")).hexdigest()
     target_text = ", ".join(unique_targets)
-    prefix = (f"{header} to {target_text}\n"
-              f"SHA-256 of full {mode} proposal text (UTF-8): {digest}\n")
-    # QQ's native approval text renderer accepts only 300 preview characters.
-    # Compact summaries fit that ceiling; retain the configured budget for
-    # non-summary payload construction and force a truthful compact fallback.
-    budget = _preview_limit()
-    fits_transport = len(prefix) + len(proposal) <= min(budget, 300)
-    if fits_transport:
-        display = prefix + proposal
-    else:
-        # Preserve scope and proposal identity in a compact fallback that fits
-        # QQ's 300-character transport limit.
-        display = (f"{mode}; proposal omitted from preview; targets={len(unique_targets)}; "
-                   f"ordered target-list SHA-256={path_digest}; "
-                   f"proposal SHA-256={digest}")
+
+    def _display_for_budget(limit: int) -> tuple[str, bool]:
+        full = (f"{header} to {target_text}\n"
+                f"SHA-256 of full {mode} proposal text (UTF-8): {digest}\n"
+                f"{proposal}")
+        if len(full) <= limit:
+            return full, False
+
+        # A long absolute path can consume the entire preview even when the
+        # proposal is small. Keep the exact target identity by digest, but use
+        # basenames for readable scope before considering a summary-only view.
+        target_names = ", ".join(target.replace("\\", "/").rsplit("/", 1)[-1]
+                                 for target in unique_targets)
+        compact_prefix = (f"{header} to {target_names} [targets={len(unique_targets)}; "
+                          f"ordered target-list SHA-256={path_digest}]\n"
+                          f"Proposal SHA-256={digest}\n")
+        if len(compact_prefix) + len(proposal) <= limit:
+            return compact_prefix + proposal, False
+
+        summary = (f"{mode}; proposal omitted from preview; targets={len(unique_targets)}; "
+                   f"ordered target-list SHA-256={path_digest}; proposal SHA-256={digest}")
+        return summary[:limit], True
+
+    display, preview_truncated = _display_for_budget(budget)
     return {"display": display, "operation": operation, "mode": mode,
-            "proposal_sha256": digest, "preview_truncated": not fits_transport}
+            "proposal_sha256": digest, "target_list_sha256": path_digest,
+            "preview_truncated": preview_truncated}

@@ -347,6 +347,9 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
     if proposal is not None:
         try:
             from tools.approval_payload import build_approval_payload
+            from tools.approval_context import _get_session_platform
+            if _get_session_platform() == "qqbot":
+                proposal = {**proposal, "max_chars": 300}
             payload = build_approval_payload(paths, **proposal)
         except Exception:
             # Approval display is part of consent; a broken preview must never
