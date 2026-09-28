@@ -706,32 +706,10 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     age_seconds = now - last_ready_ts
-    # A recorded guard explains a held dispatch, not a missing worker. Keep the
-    # diagnostic read-only and historical: the event alone cannot prove the
-    # guard is still active, so render its reason/time without a reassign action.
+    # Guard events explain why an earlier spawn was skipped, but are historical;
+    # they cannot establish that a time-bound or state-dependent guard applies now.
     latest_guard = next((ev for ev in reversed(events)
                          if _event_kind(ev) == "respawn_guarded"), None)
-    if latest_guard is not None:
-        payload = _parse_payload(latest_guard)
-        reason = str(payload.get("reason") or "unknown")
-        guard_ts = _event_ts(latest_guard)
-        clearing_kinds = {
-            "promoted", "unblocked", "assigned", "changes_requested", "review_reopened",
-            "completed", "archived",
-        }
-        if not any(_event_kind(ev) in clearing_kinds and _event_ts(ev) > guard_ts for ev in events):
-            return [Diagnostic(
-                kind="stranded_in_ready", severity="info",
-                title=f"Ready task has recorded {reason} guard",
-                detail="Dispatch recorded a respawn guard for this task. The event is historical; "
-                       "check current dispatcher output before treating the guard as active.",
-                actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
-                first_seen_at=guard_ts, last_seen_at=guard_ts, count=1,
-                data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
-                      "assignee": assignee, "guard_reason": reason, "guard_recorded_at": guard_ts,
-                      "threshold_seconds": int(threshold_seconds)},
-            )]
-
     if age_seconds < threshold_seconds:
         return []
 
@@ -749,6 +727,12 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
                          payload={"current_assignee": assignee}),
         _cli_hint("Check dispatcher status", "hermes kanban diagnostics"),
     ]
+    data = {"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+            "assignee": assignee, "threshold_seconds": int(threshold_seconds)}
+    if latest_guard is not None:
+        payload = _parse_payload(latest_guard)
+        data.update({"guard_reason": str(payload.get("reason") or "unknown"),
+                     "guard_recorded_at": _event_ts(latest_guard)})
     return [Diagnostic(
         kind="stranded_in_ready", severity=severity,
         title=f"Ready for {age_str} with no worker",
@@ -758,8 +742,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
                f"actually polling for it.",
         actions=actions,
         first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
-        data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
-              "assignee": assignee, "threshold_seconds": int(threshold_seconds)},
+        data=data,
     )]
 
 
