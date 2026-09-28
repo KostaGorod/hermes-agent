@@ -754,6 +754,63 @@ def test_model_flow_custom_persists_selected_api_mode(monkeypatch):
     assert saved_env[key_env] == "test-key"
 
 
+def test_named_custom_flow_preserves_arbitrary_provider_identity(monkeypatch):
+    """Selecting a named provider updates its configured key, not a URL-based identity."""
+    from hermes_cli.model_setup_flows_custom import _model_flow_named_custom
+
+    saved_cfg = {
+        "model": {"default": "old-model", "provider": "old-provider", "key_env": "OLD_KEY"},
+        "providers": {
+            "vendor-prod": {
+                "name": "Vendor",
+                "api": "https://same.example/v1",
+                "key_env": "VENDOR_KEY",
+                "models": {"catalog-model": {"context_length": 8192}},
+            },
+            "other-provider": {
+                "name": "Other",
+                "api": "https://same.example/v1",
+                "api_key": "other-secret-reference",
+            },
+        },
+    }
+    provider_info = {
+        "name": "Vendor",
+        "base_url": "https://same.example/v1",
+        "provider_key": "vendor-prod",
+        "key_env": "VENDOR_KEY",
+        "api_key_ref": "${VENDOR_KEY}",
+        "model": "old-model",
+        "models": ["catalog-model", "chosen-model"],
+        "discover_models": False,
+    }
+    saves = []
+
+    monkeypatch.setattr("hermes_cli.auth._save_model_choice", lambda model: None)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: saved_cfg)
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saves.append(cfg.copy()))
+    monkeypatch.setattr(
+        "hermes_cli.model_setup_flows_custom._load_config_model_section",
+        lambda: (saved_cfg, saved_cfg["model"]),
+    )
+    monkeypatch.setattr("hermes_cli.model_setup_flows_custom._commit_model_config", lambda cfg: None)
+    monkeypatch.setattr("hermes_cli.model_setup_flows_custom._radiolist", lambda *a, **k: 1)
+    monkeypatch.setattr("builtins.print", lambda *a, **k: None)
+
+    _model_flow_named_custom({}, provider_info)
+
+    assert saved_cfg["model"]["provider"] == "custom:vendor-prod"
+    assert saved_cfg["model"]["default"] == "old-model"
+    assert "key_env" not in saved_cfg["model"]
+    assert saved_cfg["providers"]["vendor-prod"]["default_model"] == "chosen-model"
+    assert saved_cfg["providers"]["vendor-prod"]["key_env"] == "VENDOR_KEY"
+    assert saved_cfg["providers"]["vendor-prod"]["models"] == {
+        "catalog-model": {"context_length": 8192}
+    }
+    assert saved_cfg["providers"]["other-provider"]["api_key"] == "other-secret-reference"
+    assert len(saves) == 1
+
+
 def test_cmd_model_forwards_nous_login_tls_options(monkeypatch):
     monkeypatch.setattr(hermes_main, "_require_tty", lambda *a: None)
     monkeypatch.setattr(
@@ -834,9 +891,10 @@ def test_save_custom_provider_uses_provided_name(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.config.save_config", _save)
 
     _save_custom_provider("http://localhost:11434/v1", name="Ollama")
-    entries = saved.get("custom_providers", [])
+    entries = saved.get("providers", {})
     assert len(entries) == 1
-    assert entries[0]["name"] == "Ollama"
+    assert entries["ollama"]["name"] == "Ollama"
+    assert entries["ollama"]["api"] == "http://localhost:11434/v1"
 
 
 def test_save_custom_provider_references_the_key_instead_of_inlining_it(monkeypatch, tmp_path):
@@ -859,10 +917,75 @@ def test_save_custom_provider_references_the_key_instead_of_inlining_it(monkeypa
         key_env="HERMES_CUSTOM_LOCALHOST_11434_API_KEY",
     )
 
-    entry = saved["custom_providers"][0]
+    entry = saved["providers"]["ollama"]
     assert entry["key_env"] == "HERMES_CUSTOM_LOCALHOST_11434_API_KEY"
     assert "api_key" not in entry
     assert "sk-secret" not in yaml.safe_dump(saved)
+
+
+def test_save_custom_provider_keeps_named_shared_url_entries_separate(monkeypatch):
+    from hermes_cli.main_provider_setup import _save_custom_provider
+
+    saved = {}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
+    _save_custom_provider("https://proxy.example/v1", model="model-a", name="Alpha")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: saved)
+    _save_custom_provider("https://proxy.example/v1", model="model-b", name="Beta")
+
+    assert set(saved["providers"]) == {"alpha", "beta"}
+    assert saved["providers"]["alpha"]["default_model"] == "model-a"
+    assert saved["providers"]["beta"]["default_model"] == "model-b"
+
+
+def test_save_custom_provider_reuses_unique_named_arbitrary_key(monkeypatch):
+    from hermes_cli.main_provider_setup import _save_custom_provider
+
+    saved = {}
+    config = {"providers": {
+        "endpoint-prod-7f3a": {"name": "Friendly Alpha", "api": "https://old.example/v1",
+                               "transport": "anthropic_messages", "key_env": "ALPHA_KEY",
+                               "models": {"curated": {"context_length": 8192}}},
+        "beta": {"name": "Beta", "api": "https://beta.example/v1"},
+    }}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
+
+    _save_custom_provider("https://new.example/v1", model="selected", name="Friendly Alpha")
+
+    assert set(saved["providers"]) == {"endpoint-prod-7f3a", "beta"}
+    assert saved["providers"]["endpoint-prod-7f3a"] == {
+        "name": "Friendly Alpha", "api": "https://new.example/v1", "transport": "anthropic_messages",
+        "key_env": "ALPHA_KEY", "models": {"curated": {"context_length": 8192}},
+        "default_model": "selected",
+    }
+
+
+def test_save_custom_provider_migrates_matching_legacy_metadata_once(monkeypatch):
+    from hermes_cli.main_provider_setup import _save_custom_provider
+
+    saved = {}
+    other_legacy = {"name": "Other", "base_url": "https://old.example/v1", "model": "other-model"}
+    same_name_other_url = {"name": "Gateway", "base_url": "https://other.example/v1", "model": "other-model"}
+    config = {"custom_providers": [
+        {"name": "Gateway", "base_url": "https://new.example/v1", "key_env": "GATEWAY_KEY",
+         "api_mode": "anthropic_messages", "models": {"curated": {"context_length": 16384}},
+         "extra_headers": {"X-Tenant": "tenant-a"}},
+        other_legacy,
+        same_name_other_url,
+    ]}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
+    _save_custom_provider("https://new.example/v1", model="selected", name="Gateway")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: saved)
+    _save_custom_provider("https://new.example/v1", model="selected", name="Gateway")
+
+    assert saved["custom_providers"] == [other_legacy, same_name_other_url]
+    assert saved["providers"]["gateway"] == {
+        "name": "Gateway", "api": "https://new.example/v1", "key_env": "GATEWAY_KEY",
+        "transport": "anthropic_messages", "models": {"curated": {"context_length": 16384}},
+        "extra_headers": {"X-Tenant": "tenant-a"}, "default_model": "selected",
+    }
 
 
 

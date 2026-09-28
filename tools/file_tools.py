@@ -767,7 +767,10 @@ def _resolve_or_none(filepath: str, task_id: str, *, entry: bool = False) -> str
 
 
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
-                          cross_profile: bool) -> str | None:
+                          cross_profile: bool, *, operation: str = "patch", content: str | None = None,
+                          old_content: str | None = None, new_content: str | None = None,
+                          append: bool = False, mode: str | None = None,
+                          approval_targets: list[str] | None = None) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
 
     Order matters: hard denies (sensitive path, mirror) and the corruption
@@ -783,7 +786,9 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
         err = _check_binary_document_write(p, task_id)
         if err:
             return err
-    return (_check_protected_instruction_write(paths, task_id)
+    return (_check_protected_instruction_write(
+                paths, task_id, operation=operation, content=content, old_content=old_content,
+                new_content=new_content, append=append, mode=mode, approval_targets=approval_targets)
             or _check_approval_required_write(paths, task_id))
 
 
@@ -870,7 +875,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
-           or _check_protected_instruction_write([path], task_id)
+           or _check_protected_instruction_write([path], task_id, operation="write", content=content,
+                                                 approval_targets=[path])
            or _check_approval_required_write([path], task_id)
            or (None if cross_profile else _check_cross_profile_path(path, task_id)))
     if not err and _is_internal_file_tool_content(content):
@@ -973,7 +979,18 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
         _entry_paths = collected[2]
-    precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
+    approval_operation = "patch"
+    approval_content = patch if mode == "patch" else None
+    approval_old = approval_new = None
+    approval_mode = "unified-patch" if mode == "patch" else None
+    if mode == "replace":
+        approval_old, approval_new = old_string or "", new_string or ""
+        approval_mode = "replace-all" if replace_all else "replace-one"
+        approval_operation = "replace"
+    precheck_err = _write_precheck_error(
+        _paths_to_check, _content_write_paths, task_id, cross_profile, operation=approval_operation,
+        content=approval_content, old_content=approval_old, new_content=approval_new,
+        mode=approval_mode, approval_targets=_paths_to_check)
     if precheck_err:
         return tool_error(precheck_err)
     try:

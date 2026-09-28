@@ -256,7 +256,11 @@ _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavail
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default", *,
+                                            operation: str = "patch", content: str | None = None,
+                                            old_content: str | None = None, new_content: str | None = None,
+                                            append: bool = False, mode: str | None = None,
+                                            approval_targets: list[str] | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -268,12 +272,19 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve).")
-    display = f"<write to {targets}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
         "etc.).")
+    try:
+        from tools.approval_payload import build_approval_payload
+        payload = build_approval_payload(approval_targets or reasons, operation, content=content,
+                                         old_content=old_content, new_content=new_content,
+                                         append=append, mode=mode)
+    except Exception:
+        return blocked.format(why="could not safely prepare the approval preview.")
+    display = payload["display"]
     timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
     denied = blocked.format(why="was denied by the user.")
 
@@ -296,7 +307,7 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
 
     if notify_cb is not None:
         approval_data = {
-            "command": display,
+            **payload,
             "pattern_key": "protected_instruction_file",
             "pattern_keys": ["protected_instruction_file"],
             "description": description,
@@ -331,7 +342,11 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(paths: list[str], task_id: str = "default", *,
+                                       operation: str = "patch", content: str | None = None,
+                                       old_content: str | None = None, new_content: str | None = None,
+                                       append: bool = False, mode: str | None = None,
+                                       approval_targets: list[str] | None = None) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
     enabled, extra = _protected_instruction_config()
@@ -341,7 +356,9 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
                            for p in paths) if r]
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(
+        reasons, task_id, operation=operation, content=content, old_content=old_content,
+        new_content=new_content, append=append, mode=mode, approval_targets=approval_targets)
 
 
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:

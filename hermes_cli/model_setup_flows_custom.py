@@ -207,7 +207,7 @@ def _model_flow_custom(config):
         config["model"] = _caller_model
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
-    # Auto-save to custom_providers so it appears in the menu next time
+    # Auto-save to custom providers so it appears in the menu next time
     _save_custom_provider(effective_url, effective_key, model_name or "", context_length=context_length,
                           name=display_name, api_mode=api_mode, key_env=custom_key_env)
     _prune_replaced_custom_model_config_credentials(effective_url, provider_name=display_name)

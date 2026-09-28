@@ -743,6 +743,10 @@ def _approval_request_payload(data: dict | None) -> dict:
     if "command" in payload:
         from gateway.run import _redact_approval_command
         payload["command"] = _redact_approval_command(payload.get("command"))
+    for key in ("preview", "display"):
+        if key in payload:
+            from agent.redact import redact_sensitive_text
+            payload[key] = redact_sensitive_text(str(payload.get(key) or ""), force=True)
     return payload
 
 
