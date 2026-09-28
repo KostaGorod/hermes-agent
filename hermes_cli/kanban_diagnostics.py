@@ -706,9 +706,6 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     age_seconds = now - last_ready_ts
-    if age_seconds < threshold_seconds:
-        return []
-
     # A recorded guard explains a held dispatch, not a missing worker. Keep the
     # diagnostic read-only and historical: the event alone cannot prove the
     # guard is still active, so render its reason/time without a reassign action.
@@ -734,6 +731,9 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
                       "assignee": assignee, "guard_reason": reason, "guard_recorded_at": guard_ts,
                       "threshold_seconds": int(threshold_seconds)},
             )]
+
+    if age_seconds < threshold_seconds:
+        return []
 
     age_str = f"{age_seconds / 3600:.1f}h" if age_seconds >= 3600 else f"{int(age_seconds / 60)}m"
     # Escalate with age: <2x threshold warning, 2x-6x error, >6x critical.
