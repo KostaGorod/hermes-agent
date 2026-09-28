@@ -504,6 +504,12 @@ def _save_custom_provider(base_url, api_key="", model="", context_length=None, n
             provider_key = matching_keys[0]
         else:
             provider_key = custom_provider_slug(name).removeprefix("custom:")
+            if provider_key in providers:
+                base_key = provider_key
+                suffix = 2
+                while provider_key in providers:
+                    provider_key = f"{base_key}-{suffix}"
+                    suffix += 1
     entry = providers.get(provider_key)
     legacy = cfg.get("custom_providers")
     if isinstance(legacy, list):

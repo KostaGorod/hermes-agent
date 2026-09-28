@@ -907,6 +907,75 @@ def test_save_custom_provider_reuses_unique_named_arbitrary_key(monkeypatch):
     }
 
 
+def test_save_custom_provider_slug_collision_does_not_reuse_other_provider(monkeypatch):
+    """A colliding normalized name must not overwrite another provider's endpoint or key."""
+    from hermes_cli.main_provider_setup import _save_custom_provider
+
+    saved = {}
+    config = {"providers": {
+        "ollama": {"name": "Personal Ollama", "api": "https://private.example/v1",
+                   "key_env": "PRIVATE_OLLAMA_KEY"},
+    }}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
+
+    _save_custom_provider("https://public.example/v1", name="Ollama")
+
+    assert saved["providers"]["ollama"] == {
+        "name": "Personal Ollama", "api": "https://private.example/v1",
+        "key_env": "PRIVATE_OLLAMA_KEY",
+    }
+    new_keys = set(saved["providers"]) - {"ollama"}
+    assert len(new_keys) == 1
+    new_entry = saved["providers"][new_keys.pop()]
+    assert new_entry["name"] == "Ollama"
+    assert new_entry["api"] == "https://public.example/v1"
+    assert "key_env" not in new_entry
+    assert "api_key" not in new_entry
+
+
+def test_model_flow_migrates_the_selected_legacy_provider_identity(monkeypatch):
+    """Selecting a named legacy entry saves it under that name, not a URL-derived duplicate."""
+    import copy
+    import hermes_cli.model_setup_flows_custom as custom_flow
+
+    legacy = {"name": "My Gateway", "base_url": "https://gateway.example/v1",
+              "model": "old-model", "key_env": "GATEWAY_KEY"}
+    state = {"custom_providers": [copy.deepcopy(legacy)],
+             "model": {"default": "before", "provider": "custom"}}
+
+    def _load():
+        return copy.deepcopy(state)
+
+    def _save(cfg):
+        state.clear()
+        state.update(copy.deepcopy(cfg))
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _load)
+    monkeypatch.setattr("hermes_cli.config.save_config", _save)
+    monkeypatch.setattr("hermes_cli.auth._save_model_choice", lambda _model: None)
+    monkeypatch.setattr("hermes_cli.auth.deactivate_provider", lambda: None)
+    monkeypatch.setattr(custom_flow, "_pick_named_custom_model", lambda *_args: "new-model")
+
+    custom_flow._model_flow_named_custom({}, {
+        "name": legacy["name"],
+        "base_url": legacy["base_url"],
+        "api_key": "",
+        "key_env": legacy["key_env"],
+        "model": legacy["model"],
+        "models": {legacy["model"]: {}},
+        "discover_models": False,
+    })
+
+    assert state["custom_providers"] == []
+    providers = state["providers"]
+    assert list(providers) == ["my-gateway"]
+    assert providers["my-gateway"]["name"] == "My Gateway"
+    assert providers["my-gateway"]["api_key"] == "${GATEWAY_KEY}"
+    assert "GATEWAY_KEY" in providers["my-gateway"]["api_key"]
+    assert providers["my-gateway"]["default_model"] == "new-model"
+
+
 def test_save_custom_provider_migrates_matching_legacy_metadata_once(monkeypatch):
     """Saving a legacy provider moves its curated catalog and credential metadata once."""
     from hermes_cli.main_provider_setup import _save_custom_provider
