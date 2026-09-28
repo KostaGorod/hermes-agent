@@ -744,6 +744,8 @@ def _approval_request_payload(data: dict | None) -> dict:
     if "command" in payload:
         from gateway.run import _redact_approval_command
         payload["command"] = _redact_approval_command(payload.get("command"))
+        if "description" in payload:
+            payload["description"] = _redact_approval_command(payload.get("description"))
     return payload
 
 

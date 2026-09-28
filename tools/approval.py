@@ -166,7 +166,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
         # ``_drop_entry`` reads ``entry.result`` under this same lock after its deadline check, so a
         # choice acked to the client here can never be popped-and-lost as a timeout (#112548).
         for entry in targets:
-            entry.result = choice
+            # Protected file writes are always one-operation grants. A stale or
+            # forged broad-scope choice must not broaden that contract, including
+            # when one /approve-all reply resolves several queued entries.
+            if entry.data.get("allow_session") is False and choice in {"session", "always"}:
+                entry.result = "once"
+            else:
+                entry.result = choice
             if reason:
                 entry.reason = reason
             entry.event.set()

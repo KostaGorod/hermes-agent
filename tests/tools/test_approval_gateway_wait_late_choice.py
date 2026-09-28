@@ -74,6 +74,25 @@ def test_resolve_commits_the_choice_before_releasing_the_approval_lock(monkeypat
     assert entry.reason == "fine"
 
 
+def test_protected_approval_cannot_become_a_session_grant():
+    _clear()
+    entry = wait_mod._ApprovalEntry({**APPROVAL, "allow_session": False, "allow_permanent": False})
+    mod._gateway_queues[SESSION_KEY] = [entry]
+
+    assert mod.resolve_gateway_approval(SESSION_KEY, "session") == 1
+    assert entry.result == "once"
+
+
+def test_resolve_all_keeps_protected_approvals_once_only():
+    _clear()
+    first = wait_mod._ApprovalEntry({**APPROVAL, "allow_session": False, "allow_permanent": False})
+    second = wait_mod._ApprovalEntry({**APPROVAL, "allow_session": False, "allow_permanent": False})
+    mod._gateway_queues[SESSION_KEY] = [first, second]
+
+    assert mod.resolve_gateway_approval(SESSION_KEY, "always", resolve_all=True) == 2
+    assert first.result == second.result == "once"
+
+
 def test_withdrawn_entry_settles_with_a_wire_reason(monkeypatch):
     """A wait woken with no choice (session teardown) withdraws its open request with a RequestCancelReason,
     not the poll-state token ``"set"``."""

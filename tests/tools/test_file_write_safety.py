@@ -673,6 +673,30 @@ class TestProtectedInstructionFiles:
         assert target.read_text(encoding="utf-8") == "approved content"
         assert len(approvals["calls"]) == 1
 
+    def test_cli_approval_discloses_redacted_write_proposal(self, tmp_path, approvals):
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        approvals["answer"] = "deny"
+        self._write(tmp_path / "AGENTS.md", f"benign marker\nTOKEN={secret}\n")
+
+        shown = approvals["calls"][0]["command"]
+        assert "benign marker" in shown
+        assert secret not in shown
+        assert "Overwrite (creates if absent)" in shown
+
+    def test_replace_approval_discloses_replace_all_scope(self, tmp_path, approvals):
+        from tools.file_tools import patch_tool
+        import json
+        target = tmp_path / "AGENTS.md"
+        target.write_text("x x", encoding="utf-8")
+        approvals["answer"] = "deny"
+        result = json.loads(patch_tool(mode="replace", path=str(target), old_string="x",
+                                       new_string="y", replace_all=True))
+
+        assert result.get("error")
+        shown = approvals["calls"][0]["command"]
+        assert "Replace all matches" in shown
+        assert '"replace_all":true' in shown
+
     def test_prompts_even_under_yolo(self, tmp_path, approvals, monkeypatch):
         """The whole point: auto-approve/yolo must NOT bypass this gate."""
         import tools.approval as A
