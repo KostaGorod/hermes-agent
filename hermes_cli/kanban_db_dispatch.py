@@ -1767,7 +1767,9 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     for row in rows:
         if not profile_exists(row["assignee"]):
             continue
-        if check_respawn_guard(conn, row["id"], lane=status):
+        # Recent successes and PR URLs are inputs to review handoffs; only
+        # ready work needs those duplicate-work guards applied here.
+        if status == "ready" and check_respawn_guard(conn, row["id"], lane=status):
             continue
         return True
     return False
