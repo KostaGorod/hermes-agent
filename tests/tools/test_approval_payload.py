@@ -20,3 +20,23 @@ def test_replace_payload_identifies_scope():
                                      new_content="new", mode="replace-all")
     assert payload["mode"] == "replace-all"
     assert "scope: replace-all" in payload["preview"]
+
+
+def test_configured_preview_limit_is_capped(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"security": {"approval_preview_max_chars": 10**9}},
+    )
+    payload = build_approval_payload(["AGENTS.md"], "write", content="x" * 20000)
+    assert payload["preview_truncated"] is True
+    assert len(payload["preview"]) < 200
+
+
+def test_invalid_configured_preview_limit_uses_default(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"security": {"approval_preview_max_chars": True}},
+    )
+    payload = build_approval_payload(["AGENTS.md"], "write", content="x" * 2000)
+    assert payload["preview_truncated"] is True
+    assert len(payload["preview"]) < 200

@@ -4,6 +4,7 @@ import difflib
 import hashlib
 
 _DEFAULT_PREVIEW_MAX_CHARS = 1500
+_HARD_PREVIEW_MAX_CHARS = 10000
 
 
 def build_approval_payload(targets, operation: str, *, content: str | None = None,
@@ -33,6 +34,7 @@ def build_approval_payload(targets, operation: str, *, content: str | None = Non
         limit = load_config().get("security", {}).get("approval_preview_max_chars", _DEFAULT_PREVIEW_MAX_CHARS)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
             limit = _DEFAULT_PREVIEW_MAX_CHARS
+        limit = min(limit, _HARD_PREVIEW_MAX_CHARS)
     except Exception:
         limit = _DEFAULT_PREVIEW_MAX_CHARS
 
