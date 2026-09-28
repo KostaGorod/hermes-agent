@@ -492,10 +492,18 @@ def _save_custom_provider(base_url, api_key="", model="", context_length=None, n
             key for key, candidate in providers.items()
             if isinstance(candidate, dict)
             and str(candidate.get("name") or key).strip().casefold() == name.casefold()
-            and str(candidate.get("api") or candidate.get("url") or candidate.get("base_url") or "").strip().rstrip("/").casefold()
-            == str(base_url).strip().rstrip("/").casefold()
         ]
-        provider_key = matching_keys[0] if len(matching_keys) == 1 else custom_provider_slug(name).removeprefix("custom:")
+        exact_url_keys = [
+            key for key in matching_keys
+            if str(providers[key].get("api") or providers[key].get("url") or providers[key].get("base_url") or "")
+            .strip().rstrip("/").casefold() == str(base_url).strip().rstrip("/").casefold()
+        ]
+        if len(exact_url_keys) == 1:
+            provider_key = exact_url_keys[0]
+        elif len(matching_keys) == 1:
+            provider_key = matching_keys[0]
+        else:
+            provider_key = custom_provider_slug(name).removeprefix("custom:")
     entry = providers.get(provider_key)
     legacy = cfg.get("custom_providers")
     if isinstance(legacy, list):

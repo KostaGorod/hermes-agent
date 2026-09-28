@@ -883,6 +883,30 @@ def test_save_custom_provider_keeps_named_shared_url_entries_separate(monkeypatc
     assert saved["providers"]["beta"]["default_model"] == "model-b"
 
 
+def test_save_custom_provider_reuses_unique_named_arbitrary_key(monkeypatch):
+    """A display name identifies its existing keyed entry even when its URL changes."""
+    from hermes_cli.main_provider_setup import _save_custom_provider
+
+    saved = {}
+    config = {"providers": {
+        "endpoint-prod-7f3a": {"name": "Friendly Alpha", "api": "https://old.example/v1",
+                               "transport": "anthropic_messages", "key_env": "ALPHA_KEY",
+                               "models": {"curated": {"context_length": 8192}}},
+        "beta": {"name": "Beta", "api": "https://beta.example/v1"},
+    }}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
+
+    _save_custom_provider("https://new.example/v1", model="selected", name="Friendly Alpha")
+
+    assert set(saved["providers"]) == {"endpoint-prod-7f3a", "beta"}
+    assert saved["providers"]["endpoint-prod-7f3a"] == {
+        "name": "Friendly Alpha", "api": "https://new.example/v1", "transport": "anthropic_messages",
+        "key_env": "ALPHA_KEY", "models": {"curated": {"context_length": 8192}},
+        "default_model": "selected",
+    }
+
+
 def test_save_custom_provider_migrates_matching_legacy_metadata_once(monkeypatch):
     """Saving a legacy provider moves its curated catalog and credential metadata once."""
     from hermes_cli.main_provider_setup import _save_custom_provider
