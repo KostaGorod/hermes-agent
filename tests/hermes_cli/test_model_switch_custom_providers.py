@@ -1739,8 +1739,9 @@ def test_save_discovered_models_persists_keyed_entry_by_identity(monkeypatch):
     saved = []
     config = {
         "providers": {
-            "alpha": {"api": "https://proxy.example/v1", "transport": "openai_chat",
-                      "key_env": "ALPHA_KEY", "models": {"old": {}}, "models_discovered": True},
+            "endpoint-prod-7f3a": {"name": "Friendly Alpha", "api": "https://proxy.example/v1",
+                                    "transport": "openai_chat", "key_env": "ALPHA_KEY",
+                                    "models": {"old": {}}, "models_discovered": True},
             "beta": {"api": "https://proxy.example/v1", "transport": "openai_chat",
                      "key_env": "BETA_KEY", "models": {"old": {}}},
         }
@@ -1750,11 +1751,11 @@ def test_save_discovered_models_persists_keyed_entry_by_identity(monkeypatch):
 
     _save_discovered_models_to_config(
         "https://proxy.example/v1", ["fresh"], api_mode="openai_chat",
-        provider_key="alpha", credential_identity="env:ALPHA_KEY")
+        provider_key="endpoint-prod-7f3a", credential_identity="env:ALPHA_KEY")
 
     assert len(saved) == 1
-    assert config["providers"]["alpha"]["models"] == {"fresh": {}}
-    assert config["providers"]["alpha"]["models_discovered"] is True
+    assert config["providers"]["endpoint-prod-7f3a"]["models"] == {"fresh": {}}
+    assert config["providers"]["endpoint-prod-7f3a"]["models_discovered"] is True
     assert config["providers"]["beta"]["models"] == {"old": {}}
 
 
